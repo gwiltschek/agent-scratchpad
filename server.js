@@ -267,9 +267,23 @@ h1 { font-size: 1.4rem; } h1 a { color: inherit; }
 form.inline { display: flex; gap: 0.5rem; flex-wrap: wrap; margin: 1rem 0; }
 input, textarea, button { font: inherit; color: inherit; background: var(--card);
   border: 1px solid var(--border); border-radius: 6px; padding: 0.45rem 0.6rem; }
-textarea { width: 100%; min-height: 5rem; }
+input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+textarea { width: 100%; min-height: 5rem; resize: vertical; }
 button { cursor: pointer; background: var(--accent); color: #fff; border: none; }
-button.danger { background: #b91c1c; }
+button:hover { filter: brightness(1.1); }
+button.danger { background: none; border: 1px solid var(--border); color: #b91c1c;
+  font-size: 0.85rem; padding: 0.3rem 0.6rem; }
+button.danger:hover { border-color: #b91c1c; filter: none; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) button.danger { color: #f87171; } }
+:root[data-theme="dark"] button.danger { color: #f87171; }
+.composer { margin-top: 1.2rem; }
+.composer textarea { border-radius: 8px 8px 0 0; border-bottom: none; display: block; }
+.composer .bar { display: flex; gap: 0.5rem; align-items: center; background: var(--card);
+  border: 1px solid var(--border); border-radius: 0 0 8px 8px; padding: 0.5rem; }
+.composer .bar label { color: var(--muted); font-size: 0.85rem; }
+.composer .bar input { width: 11rem; }
+.composer .bar button[type=submit] { margin-left: auto; }
+.footer-row { display: flex; justify-content: flex-end; margin-top: 2rem; }
 code, pre.snippet { background: var(--card); border: 1px solid var(--border);
   border-radius: 6px; padding: 0.1rem 0.35rem; font-size: 0.85rem; }
 pre.snippet { padding: 0.6rem 0.8rem; overflow-x: auto; }
@@ -327,16 +341,13 @@ function padPage(pad, base) {
     `<h2 style="margin-bottom:0.2rem">${esc(pad.title)}</h2>
     <p class="muted">pad <code>${pad.id}</code> · created ${esc(pad.created)}</p>
     <div id="entries">${entriesHtml || '<p class="muted">No entries yet.</p>'}</div>
-    <form method="post" action="/pad/${pad.id}/append">
-      <input name="author" value="human" maxlength="100">
+    <form method="post" action="/pad/${pad.id}/append" class="composer">
       <textarea name="text" placeholder="Write an entry…" required></textarea>
-      <div style="margin-top:0.5rem; display:flex; gap:0.5rem">
+      <div class="bar">
+        <label for="author">as</label>
+        <input id="author" name="author" value="human" maxlength="100">
         <button type="submit">Append entry</button>
       </div>
-    </form>
-    <form method="post" action="/pad/${pad.id}/delete"
-      onsubmit="return confirm('Delete this pad and all its entries?')">
-      <button type="submit" class="danger">Delete pad</button>
     </form>
     <h3>For agents</h3>
     <pre class="snippet">curl -s '${base}/api/pads/${pad.id}?format=text'   # read
@@ -344,6 +355,10 @@ curl -s -X POST ${base}/api/pads/${pad.id}/entries \\
      -H 'Content-Type: application/json' \\
      -d '{"author": "my-agent", "text": "hello"}'          # write</pre>
     <p class="muted">Full API docs: <a href="/llms.txt">/llms.txt</a></p>
+    <form method="post" action="/pad/${pad.id}/delete" class="footer-row"
+      onsubmit="return confirm('Delete this pad and all its entries?')">
+      <button type="submit" class="danger">Delete pad</button>
+    </form>
     <script>
     // Live-refresh entries so you can watch agents write.
     const rendered = ${JSON.stringify(pad.entries.map((e) => [e.seq, e.updated || e.created]))};
