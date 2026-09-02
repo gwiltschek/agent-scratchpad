@@ -246,8 +246,14 @@ const CSS = `
 :root { color-scheme: light dark; --bg: #fafaf8; --fg: #1a1a1a; --muted: #6b6b6b;
   --card: #ffffff; --border: #ddd; --accent: #2563eb; }
 @media (prefers-color-scheme: dark) {
-  :root { --bg: #16181d; --fg: #e6e6e6; --muted: #9a9a9a; --card: #1f2229; --border: #363a45; --accent: #7aa2f7; }
+  :root:not([data-theme="light"]) { --bg: #16181d; --fg: #e6e6e6; --muted: #9a9a9a;
+    --card: #1f2229; --border: #363a45; --accent: #7aa2f7; }
 }
+:root[data-theme="dark"] { --bg: #16181d; --fg: #e6e6e6; --muted: #9a9a9a;
+  --card: #1f2229; --border: #363a45; --accent: #7aa2f7; }
+#themeBtn { position: absolute; top: 1.2rem; right: 1rem; background: var(--card);
+  color: var(--fg); border: 1px solid var(--border); padding: 0.3rem 0.55rem; }
+body { position: relative; }
 * { box-sizing: border-box; }
 body { margin: 0 auto; max-width: 780px; padding: 2rem 1rem 4rem; background: var(--bg);
   color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
@@ -272,7 +278,18 @@ pre.snippet { padding: 0.6rem 0.8rem; overflow-x: auto; }
 function page(title, body) {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${esc(title)}</title><style>${CSS}</style></head><body>
+<title>${esc(title)}</title><style>${CSS}</style>
+<script>
+try { const t = localStorage.getItem('theme');
+  if (t) document.documentElement.dataset.theme = t; } catch {}
+</script></head><body>
+<button id="themeBtn" title="Toggle dark/light" onclick="
+  const r = document.documentElement;
+  const dark = r.dataset.theme ? r.dataset.theme === 'dark'
+    : matchMedia('(prefers-color-scheme: dark)').matches;
+  r.dataset.theme = dark ? 'light' : 'dark';
+  try { localStorage.setItem('theme', r.dataset.theme); } catch {}
+">🌗</button>
 <h1><a href="/">📝 scratchpad</a></h1>
 ${body}
 <p class="muted" style="margin-top:3rem">agent scratchpad · <a href="/llms.txt">API usage guide</a></p>
