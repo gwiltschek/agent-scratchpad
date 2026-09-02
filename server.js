@@ -9,7 +9,7 @@ const crypto = require('node:crypto');
 
 const PORT = Number(process.env.PORT) || 9743;
 const HOST = process.env.HOST || '0.0.0.0';
-const DATA_DIR = path.join(__dirname, 'data');
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const MAX_BODY = 1024 * 1024; // 1 MB
 const ID_RE = /^[a-z0-9]{8}$/;
 
@@ -55,10 +55,10 @@ function listPads() {
       title: pad.title,
       created: pad.created,
       entryCount: pad.entries.length,
-      lastActivity: pad.entries.length
-        ? pad.entries[pad.entries.length - 1].updated ||
-          pad.entries[pad.entries.length - 1].created
-        : pad.created,
+      lastActivity: pad.entries.reduce((mx, e) => {
+        const t = e.updated || e.created;
+        return t > mx ? t : mx;
+      }, pad.created),
       url: `/pad/${pad.id}`,
       apiUrl: `/api/pads/${pad.id}`,
     }))
@@ -104,7 +104,11 @@ function readBody(req) {
 async function readJsonBody(req) {
   const raw = await readBody(req);
   if (!raw.trim()) return {};
-  return JSON.parse(raw);
+  const parsed = JSON.parse(raw);
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new SyntaxError('body must be a JSON object');
+  }
+  return parsed;
 }
 
 function esc(s) {
@@ -163,7 +167,7 @@ function apiAppendEntry(res, pad, body) {
 function apiEditEntry(res, pad, seq, body) {
   const entry = pad.entries.find((e) => e.seq === seq);
   if (!entry) return sendJson(res, 404, { error: `no entry ${seq} in pad ${pad.id}` });
-  const author = typeof body.author === 'string' ? body.author.trim() : '';
+  const author = typeof body.author === 'string' ? body.author.trim().slice(0, 100) : '';
   const text = typeof body.text === 'string' ? body.text : null;
   if (!author || text === null) {
     return sendJson(res, 400, { error: 'body must be {"author": "...", "text": "..."}' });
@@ -385,6 +389,8 @@ curl -s -X POST ${base}/api/pads/${pad.id}/entries \\
     setInterval(async () => {
       if (document.querySelector('form.editform:not([hidden])')) return;
       if (document.activeElement && document.activeElement.matches('textarea, input')) return;
+      const draft = [...document.querySelectorAll('form:not([hidden]) textarea')];
+      if (draft.some((t) => t.value !== t.defaultValue)) return;
       try {
         const r = await fetch('/api/pads/${pad.id}');
         if (!r.ok) return;
@@ -406,7 +412,12 @@ function parseForm(raw) {
 // ---------- router ----------
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  let url;
+  try {
+    url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  } catch {
+    return sendJson(res, 400, { error: 'malformed URL or Host header' });
+  }
   const base = url.origin;
   const p = url.pathname;
   const m = (re) => p.match(re);
@@ -438,14 +449,16 @@ const server = http.createServer(async (req, res) => {
       }
     }
     if ((match = m(/^\/api\/pads\/([a-z0-9]{8})\/entries$/)) && req.method === 'POST') {
+      const body = await readJsonBody(req);
       const pad = loadPad(match[1]);
       if (!pad) return sendJson(res, 404, { error: `no pad ${match[1]}` });
-      return apiAppendEntry(res, pad, await readJsonBody(req));
+      return apiAppendEntry(res, pad, body);
     }
     if ((match = m(/^\/api\/pads\/([a-z0-9]{8})\/entries\/(\d+)$/)) && req.method === 'PUT') {
+      const body = await readJsonBody(req);
       const pad = loadPad(match[1]);
       if (!pad) return sendJson(res, 404, { error: `no pad ${match[1]}` });
-      return apiEditEntry(res, pad, Number(match[2]), await readJsonBody(req));
+      return apiEditEntry(res, pad, Number(match[2]), body);
     }
 
     // --- web UI ---
@@ -471,9 +484,9 @@ const server = http.createServer(async (req, res) => {
       return sendHtml(res, 200, padPage(pad, base));
     }
     if ((match = m(/^\/pad\/([a-z0-9]{8})\/append$/)) && req.method === 'POST') {
+      const form = parseForm(await readBody(req));
       const pad = loadPad(match[1]);
       if (!pad) return sendHtml(res, 404, page('not found', '<p>No such pad.</p>'));
-      const form = parseForm(await readBody(req));
       const author = (form.author || '').trim().slice(0, 100) || 'human';
       if (typeof form.text === 'string' && form.text.length) {
         pad.entries.push({
@@ -489,12 +502,12 @@ const server = http.createServer(async (req, res) => {
       return res.end();
     }
     if ((match = m(/^\/pad\/([a-z0-9]{8})\/edit\/(\d+)$/)) && req.method === 'POST') {
+      const form = parseForm(await readBody(req));
       const pad = loadPad(match[1]);
       if (!pad) return sendHtml(res, 404, page('not found', '<p>No such pad.</p>'));
-      const form = parseForm(await readBody(req));
       const entry = pad.entries.find((e) => e.seq === Number(match[2]));
       if (!entry) return sendHtml(res, 404, page('not found', '<p>No such entry.</p>'));
-      if ((form.author || '').trim() !== entry.author) {
+      if ((form.author || '').trim().slice(0, 100) !== entry.author) {
         return sendHtml(res, 403, page('forbidden',
           `<p>Entry #${entry.seq} belongs to <strong>${esc(entry.author)}</strong>; only its author may edit it.
           <a href="/pad/${pad.id}">Back</a></p>`));
@@ -526,3 +539,10 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   console.log(`scratchpad listening on http://${HOST}:${PORT}`);
 });
+
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, () => {
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 3000).unref();
+  });
+}
