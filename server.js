@@ -119,6 +119,67 @@ function esc(s) {
     .replaceAll('"', '&quot;');
 }
 
+// Markdown subset renderer. Input is escaped FIRST, then transformed, so no
+// caller-supplied HTML can ever survive into the output.
+function mdInline(escaped) {
+  return escaped
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, text, href) =>
+      // Only http(s) and site-relative links become anchors; anything else
+      // (javascript:, data:, ...) stays literal text.
+      /^https?:\/\/|^\/(?!\/)/.test(href) ? `<a href="${href}" rel="noopener">${text}</a>` : m
+    )
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*\w])\*([^*\n]+)\*(?![*\w])/g, '$1<em>$2</em>')
+    .replace(/(^|[^_\w])_([^_\n]+)_(?![_\w])/g, '$1<em>$2</em>');
+}
+
+function mdBlocks(raw) {
+  const out = [];
+  const lines = esc(raw).split('\n');
+  let para = [];
+  let list = null;
+
+  const flushPara = () => {
+    if (para.length) out.push(`<p>${mdInline(para.join('<br>'))}</p>`);
+    para = [];
+  };
+  const flushList = () => {
+    if (list) out.push(`<ul>${list.map((li) => `<li>${mdInline(li)}</li>`).join('')}</ul>`);
+    list = null;
+  };
+
+  for (const line of lines) {
+    const heading = line.match(/^(#{1,3})\s+(.*)$/);
+    const item = line.match(/^\s*[-*]\s+(.*)$/);
+    if (heading) {
+      flushPara(); flushList();
+      out.push(`<div class="mdh">${mdInline(heading[2])}</div>`);
+    } else if (item) {
+      flushPara();
+      (list ||= []).push(item[1]);
+    } else if (!line.trim()) {
+      flushPara(); flushList();
+    } else {
+      flushList();
+      para.push(line);
+    }
+  }
+  flushPara(); flushList();
+  return out.join('');
+}
+
+function renderMarkdown(text) {
+  // Split on ``` fences first so nothing inside a code block is transformed.
+  const parts = String(text).split(/^```[^\n]*\n?/m);
+  let html = '';
+  for (let i = 0; i < parts.length; i++) {
+    if (i % 2 === 0) html += mdBlocks(parts[i]);
+    else html += `<pre class="codeblock">${esc(parts[i].replace(/\n$/, ''))}</pre>`;
+  }
+  return html;
+}
+
 function padAsText(pad) {
   const lines = [`# ${pad.title} (pad ${pad.id})`, `created: ${pad.created}`, ''];
   for (const e of pad.entries) {
@@ -235,6 +296,13 @@ Errors are JSON: {"error": "..."} with status 400 (bad body),
 403 (editing someone else's entry), or 404 (unknown pad/entry).
 Request bodies are capped at 1 MB.
 
+Formatting
+----------
+Entry text is stored and returned RAW by this API. The web UI renders it as a
+markdown subset: \`\`\` fenced code blocks, \`inline code\`, **bold**, *italic*,
+[links](https://example.com), # headings, and - bullet lists. Anything else
+(tables, blockquotes, images, HTML) is shown as literal text.
+
 Conventions for agents
 ----------------------
 - Pick a stable author name and reuse it (e.g. "claude-backend", "ci-watcher").
@@ -295,6 +363,19 @@ button.danger:hover { border-color: #b91c1c; filter: none; }
 code, pre.snippet { background: var(--card); border: 1px solid var(--border);
   border-radius: 6px; padding: 0.1rem 0.35rem; font-size: 0.85rem; }
 pre.snippet { padding: 0.6rem 0.8rem; overflow-x: auto; }
+.md { margin-top: 0.4rem; word-break: break-word; }
+.md p { margin: 0.5rem 0; }
+.md p:first-child { margin-top: 0; }
+.md p:last-child, .md > :last-child { margin-bottom: 0; }
+.md .mdh { font-weight: 600; font-size: 1rem; margin: 0.8rem 0 0.3rem; }
+.md .mdh:first-child { margin-top: 0; }
+.md ul { margin: 0.4rem 0; padding-left: 1.4rem; }
+.md li { margin: 0.15rem 0; }
+.md code { background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+  padding: 0.05rem 0.3rem; font-size: 0.85em; }
+.md pre.codeblock { background: var(--bg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 0.6rem 0.8rem; margin: 0.5rem 0; overflow-x: auto;
+  white-space: pre; font-size: 0.85em; }
 `;
 
 function page(title, body) {
@@ -342,7 +423,7 @@ function padPage(pad, base) {
       (e) => `<div class="card entry"><span class="muted"><strong>${esc(e.author)}</strong>
       · #${e.seq} · ${esc(e.created)}${e.updated ? ` · edited ${esc(e.updated)}` : ''}
       <button type="button" class="editbtn" data-seq="${e.seq}">edit</button></span>
-      <pre>${esc(e.text)}</pre>
+      <div class="md">${renderMarkdown(e.text)}</div>
       <form class="composer editform" id="ef${e.seq}" method="post" action="/pad/${pad.id}/edit/${e.seq}" hidden>
         <textarea name="text" required>${esc(e.text)}</textarea>
         <div class="bar">
