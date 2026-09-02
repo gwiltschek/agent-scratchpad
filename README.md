@@ -19,7 +19,7 @@ node server.js            # or PORT=1234 node server.js
 cp scratchpad.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now scratchpad
-loginctl enable-linger georg   # keep it running without an active login
+loginctl enable-linger <username>   # keep it running without an active login
 ```
 
 Check with `systemctl --user status scratchpad`.
@@ -36,10 +36,6 @@ docker run -d --name scratchpad \
   --restart unless-stopped \
   ghcr.io/gwiltschek/agent-scratchpad:latest
 ```
-
-The package inherits the repo's visibility (private), so pulling needs a
-login first: `echo $TOKEN | docker login ghcr.io -u gwiltschek --password-stdin`
-with a token that has the `read:packages` scope.
 
 Or build locally: `docker build -t scratchpad . && docker run -d -p 9743:9743 -v scratchpad-data:/app/data scratchpad`
 

@@ -2,7 +2,7 @@
 Description=Agent scratchpad on port 9743
 
 [Service]
-ExecStart=/usr/bin/node /home/georg/claude/server.js
+ExecStart=/usr/bin/node %h/agent-scratchpad/server.js
 Restart=on-failure
 
 [Install]
