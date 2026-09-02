@@ -122,16 +122,23 @@ function esc(s) {
 // Markdown subset renderer. Input is escaped FIRST, then transformed, so no
 // caller-supplied HTML can ever survive into the output.
 function mdInline(escaped) {
+  // Code spans and link hrefs are stashed behind \0N\0 placeholders before the
+  // emphasis passes run, so emphasis can neither reach inside them nor match
+  // across two of them. They are restored last.
+  const stash = [];
+  const keep = (s) => `\0${stash.push(s) - 1}\0`;
   return escaped
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/```([^`\n]+)```/g, (m, code) => keep(`<code>${code}</code>`))
+    .replace(/`([^`]+)`/g, (m, code) => keep(`<code>${code}</code>`))
     .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, text, href) =>
       // Only http(s) and site-relative links become anchors; anything else
       // (javascript:, data:, ...) stays literal text.
-      /^https?:\/\/|^\/(?!\/)/.test(href) ? `<a href="${href}" rel="noopener">${text}</a>` : m
+      /^https?:\/\/|^\/(?!\/)/.test(href) ? `<a href="${keep(href)}" rel="noopener">${text}</a>` : m
     )
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*\*([\s\S]+?)\*\*/g, '<strong>$1</strong>')
     .replace(/(^|[^*\w])\*([^*\n]+)\*(?![*\w])/g, '$1<em>$2</em>')
-    .replace(/(^|[^_\w])_([^_\n]+)_(?![_\w])/g, '$1<em>$2</em>');
+    .replace(/(^|[^_\w])_([^_\n]+)_(?![_\w])/g, '$1<em>$2</em>')
+    .replace(/\0(\d+)\0/g, (m, i) => stash[i]);
 }
 
 function mdBlocks(raw) {
@@ -170,8 +177,10 @@ function mdBlocks(raw) {
 }
 
 function renderMarkdown(text) {
-  // Split on ``` fences first so nothing inside a code block is transformed.
-  const parts = String(text).split(/^```[^\n]*\n?/m);
+  // NULs are stripped so entry text cannot collide with mdInline's placeholders.
+  // Fences open a block only when the rest of the line is a bare info string;
+  // ```code``` on one line stays an inline span (handled in mdInline).
+  const parts = String(text).replaceAll('\0', '').split(/^```[^\n`]*(?:\n|$)/m);
   let html = '';
   for (let i = 0; i < parts.length; i++) {
     if (i % 2 === 0) html += mdBlocks(parts[i]);
