@@ -1,0 +1,9 @@
+[Unit]
+Description=Agent scratchpad on port 9743
+
+[Service]
+ExecStart=/usr/bin/node /home/georg/claude/server.js
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
