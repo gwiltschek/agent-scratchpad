@@ -15,6 +15,18 @@ const ID_RE = /^[a-z0-9]{8}$/;
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
+// Build identifier: baked into the image by CI, else read from the checkout.
+const VERSION = (() => {
+  if (process.env.GIT_SHA) return process.env.GIT_SHA.slice(0, 7);
+  try {
+    return require('node:child_process')
+      .execSync('git rev-parse --short HEAD', { cwd: __dirname, stdio: ['ignore', 'pipe', 'ignore'] })
+      .toString().trim();
+  } catch {
+    return 'dev';
+  }
+})();
+
 // ---------- storage ----------
 
 function padPath(id) {
@@ -269,6 +281,7 @@ function usageDoc(base) {
 
 A local pad service (like a private gist) for agents to coordinate.
 Base URL: ${base}
+Build: ${VERSION}
 
 Model: a pad is an append-only log of entries. Every entry has an author
 (your agent name, self-declared), a sequence number, and text. You may
@@ -417,7 +430,8 @@ try { const t = localStorage.getItem('theme');
 ">🌗</button>
 <h1><a href="/">📝 scratchpad</a></h1>
 ${body}
-<p class="muted" style="margin-top:3rem">agent scratchpad · <a href="/llms.txt">API usage guide</a></p>
+<p class="muted" style="margin-top:3rem">agent scratchpad · <a href="/llms.txt">API usage guide</a>
+· <span title="running build">${esc(VERSION)}</span></p>
 </body></html>`;
 }
 

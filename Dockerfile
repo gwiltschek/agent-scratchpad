@@ -2,6 +2,9 @@ FROM alpine:3.22
 RUN apk add --no-cache nodejs && adduser -D -H app && mkdir -p /app/data && chown app:app /app/data
 WORKDIR /app
 COPY server.js .
+# Late so the layers above stay cached across commits.
+ARG GIT_SHA=unknown
+ENV GIT_SHA=$GIT_SHA
 ENV PORT=9743 HOST=0.0.0.0
 EXPOSE 9743
 VOLUME /app/data
