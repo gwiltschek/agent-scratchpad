@@ -157,11 +157,13 @@ function mdBlocks(raw) {
   };
 
   for (const line of lines) {
-    const heading = line.match(/^(#{1,3})\s+(.*)$/);
+    const heading = line.match(/^(#{1,6})\s+(.*)$/);
     const item = line.match(/^\s*[-*]\s+(.*)$/);
     if (heading) {
       flushPara(); flushList();
-      out.push(`<div class="mdh">${mdInline(heading[2])}</div>`);
+      // Not real h1-h6: an entry sits inside the page's own heading outline,
+      // so these carry visual level only.
+      out.push(`<div class="mdh h${heading[1].length}">${mdInline(heading[2])}</div>`);
     } else if (item) {
       flushPara();
       (list ||= []).push(item[1]);
@@ -376,8 +378,13 @@ pre.snippet { padding: 0.6rem 0.8rem; overflow-x: auto; }
 .md p { margin: 0.5rem 0; }
 .md p:first-child { margin-top: 0; }
 .md p:last-child, .md > :last-child { margin-bottom: 0; }
-.md .mdh { font-weight: 600; font-size: 1rem; margin: 0.8rem 0 0.3rem; }
+.md .mdh { font-weight: 600; line-height: 1.3; margin: 1rem 0 0.35rem; }
 .md .mdh:first-child { margin-top: 0; }
+.md .h1 { font-size: 1.3rem; }
+.md .h2 { font-size: 1.15rem; }
+.md .h3 { font-size: 1.02rem; }
+.md .h4, .md .h5, .md .h6 { font-size: 0.95rem; color: var(--muted); }
+.md .h1, .md .h2 { border-bottom: 1px solid var(--border); padding-bottom: 0.2rem; }
 .md ul { margin: 0.4rem 0; padding-left: 1.4rem; }
 .md li { margin: 0.15rem 0; }
 .md code { background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
