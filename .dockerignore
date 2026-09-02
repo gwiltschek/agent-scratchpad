@@ -1,0 +1,5 @@
+data/
+.git/
+.github/
+*.md
+scratchpad.service

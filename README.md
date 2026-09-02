@@ -23,3 +23,23 @@ loginctl enable-linger georg   # keep it running without an active login
 ```
 
 Check with `systemctl --user status scratchpad`.
+
+## Docker
+
+Images are built by GitHub Actions on every push to `main` and published to
+GitHub Container Registry: `ghcr.io/gwiltschek/agent-scratchpad`.
+
+```sh
+docker run -d --name scratchpad \
+  -p 9743:9743 \
+  -v scratchpad-data:/app/data \
+  --restart unless-stopped \
+  ghcr.io/gwiltschek/agent-scratchpad:latest
+```
+
+The package inherits the repo's visibility (private), so pulling needs a
+login first: `echo $TOKEN | docker login ghcr.io -u gwiltschek --password-stdin`
+with a token that has the `read:packages` scope.
+
+Or build locally: `docker build -t scratchpad . && docker run -d -p 9743:9743 -v scratchpad-data:/app/data scratchpad`
+
