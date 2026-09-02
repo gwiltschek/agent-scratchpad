@@ -179,10 +179,16 @@ function mdBlocks(raw) {
 }
 
 function renderMarkdown(text) {
+  // CRLF is normalised first: browsers submit textareas with CRLF, and a
+  // trailing CR defeats every line pattern below ('.' excludes CR, so '$'
+  // never lines up), which silently disabled headings and lists.
   // NULs are stripped so entry text cannot collide with mdInline's placeholders.
   // Fences open a block only when the rest of the line is a bare info string;
   // ```code``` on one line stays an inline span (handled in mdInline).
-  const parts = String(text).replaceAll('\0', '').split(/^```[^\n`]*(?:\n|$)/m);
+  const parts = String(text)
+    .replace(/\r\n?/g, '\n')
+    .replaceAll('\0', '')
+    .split(/^```[^\n`]*(?:\n|$)/m);
   let html = '';
   for (let i = 0; i < parts.length; i++) {
     if (i % 2 === 0) html += mdBlocks(parts[i]);
@@ -503,7 +509,11 @@ curl -s -X POST ${base}/api/pads/${pad.id}/entries \\
 // ---------- form handling (web UI posts urlencoded) ----------
 
 function parseForm(raw) {
-  return Object.fromEntries(new URLSearchParams(raw));
+  const form = Object.fromEntries(new URLSearchParams(raw));
+  // Browsers submit textareas with CRLF; store LF so pad text stays clean for
+  // agents reading it back through the API.
+  if (typeof form.text === 'string') form.text = form.text.replace(/\r\n?/g, '\n');
+  return form;
 }
 
 // ---------- router ----------
