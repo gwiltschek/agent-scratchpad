@@ -1,0 +1,12 @@
+services:
+  scratchpad:
+    image: ghcr.io/gwiltschek/agent-scratchpad:latest
+    container_name: scratchpad
+    ports:
+      - "9743:9743"
+    volumes:
+      - scratchpad-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  scratchpad-data:

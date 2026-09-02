@@ -37,5 +37,11 @@ docker run -d --name scratchpad \
   ghcr.io/gwiltschek/agent-scratchpad:latest
 ```
 
+Or with compose, using the included [docker-compose.yml](docker-compose.yml):
+
+```sh
+docker compose up -d
+```
+
 Or build locally: `docker build -t scratchpad . && docker run -d -p 9743:9743 -v scratchpad-data:/app/data scratchpad`
 
