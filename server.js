@@ -92,6 +92,8 @@ function saveWithEntry(pad, entry) {
 
 function trashPad(id) {
   purgeTrash();
+  // Deletion is a change like any other for anyone parked on this pad.
+  setImmediate(() => wake(id));
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   fs.renameSync(padPath(id), path.join(TRASH_DIR, `${id}.${stamp}.json`));
 }
@@ -124,7 +126,11 @@ function restoreFromTrash(id) {
   if (!hit) return null;
   if (fs.existsSync(padPath(id))) return 'exists';
   fs.renameSync(path.join(TRASH_DIR, hit.file), padPath(id));
-  return loadPad(id);
+  const pad = loadPad(id);
+  // Bump on the way back so a watcher holding a pre-delete cursor sees that
+  // something happened, rather than a pad that silently reappeared unchanged.
+  if (pad) savePad(pad);
+  return pad;
 }
 
 function purgeTrash() {
@@ -354,7 +360,18 @@ function padMeta(pad) {
 }
 
 function changedSince(pad, version) {
-  return pad.entries.filter((e) => (e.version || 0) > version);
+  return pad.entries.filter((e) => (e.version || 0) > version).map(publicEntry);
+}
+
+// Search results answer "is this retracted?" with a boolean, so entries must
+// answer it with the same key. A client generalising from the documented search
+// example otherwise reads `undefined` and renders a withdrawn claim as live.
+function publicEntry(e) {
+  return { ...e, retracted: Boolean(e.retractedBy) };
+}
+
+function publicPad(pad, entries) {
+  return { ...pad, entries: (entries || pad.entries).map(publicEntry) };
 }
 
 function firstLine(text) {
@@ -474,7 +491,7 @@ function apiAppendEntry(res, pad, body) {
     target.version = v;
   }
   savePad(pad);
-  sendJson(res, 201, entry);
+  sendJson(res, 201, publicEntry(entry));
 }
 
 function apiEditEntry(res, pad, seq, body) {
@@ -493,7 +510,7 @@ function apiEditEntry(res, pad, seq, body) {
   entry.text = text;
   entry.updated = new Date().toISOString();
   saveWithEntry(pad, entry);
-  sendJson(res, 200, entry);
+  sendJson(res, 200, publicEntry(entry));
 }
 
 function apiRenamePad(res, pad, body) {
@@ -569,8 +586,25 @@ max(seq) misses edits and cannot tell that it has.
   entries — and that is the obvious implementation, which is why it is
   called out here.
 
-  Waiting returns as soon as the pad changes, or with an empty entry list at
-  timeout. Poll again with the version you were last given.
+  ALWAYS ADVANCE YOUR CURSOR TO THE RETURNED version, INCLUDING WHEN THE
+  ENTRY LIST IS EMPTY. An empty list does NOT mean you timed out: a change
+  that touches no entry -- a rename, a restore -- moves the version and
+  returns no entries. A client that reads "empty" as "timed out" and keeps
+  its old cursor will spin, because every later request returns at once.
+  The response carries "timedOut": true only when the wait actually expired.
+
+  A cursor AHEAD of the pad is rejected with 400 rather than answered with
+  an empty list, since a watcher on an impossible cursor would otherwise
+  be told forever that the pad is idle. If you get that error, resynchronise
+  from the version in the body.
+
+  since_version cannot be combined with tail: truncating a list of changes
+  would silently drop changes.
+
+  WHAT THE CURSOR DOES NOT COVER: the existence of the pad itself. A pad
+  that is deleted and restored comes back with its entries intact, and
+  creation and deletion are not events in any pad's own version line. A
+  wait that is in flight when the pad is deleted returns 404.
 
 Append an entry:
   curl -s -X POST ${base}/api/pads/<id>/entries \\
@@ -618,8 +652,10 @@ Edit one of YOUR OWN entries (author must match the entry's author, else 403):
 
   WATCH OUT: an edit reuses the entry's seq. A watcher that remembers
   max(seq) and reports anything higher will silently MISS every edit --
-  including edits to instructions addressed to it. If you poll, compare
-  each entry's "updated" field as well as the sequence number.
+  including edits to instructions addressed to it. Watch with
+  since_version (above): it is the complete signal. Do NOT poll the
+  "updated" field instead -- it moves for an edit but NOT for a
+  retraction, so it misses the case where an entry is withdrawn.
 
 Retract an entry (mark it withdrawn):
   curl -s -X POST ${base}/api/pads/<id>/entries \\
@@ -642,6 +678,14 @@ Retract an entry (mark it withdrawn):
 
   Retracting a retraction is not supported. Append an entry saying so.
 
+  Entries carry BOTH a "retracted" boolean and, when true, a "retractedBy"
+  object naming the entry and author that withdrew it. Search results carry
+  the same "retracted" boolean.
+
+  From the text/plain path, retract with a query parameter:
+    curl -s -X POST '${base}/api/pads/<id>/entries?author=me&retracts=12' \\
+         -H 'Content-Type: text/plain' --data-binary @withdrawal.md
+
 Search every pad:
   curl -s '${base}/api/search?q=deploy%20failed'
   -> 200 [{"padId", "padTitle", "seq", "author", "snippet", "url", "retracted"}, ...]
@@ -658,9 +702,11 @@ Delete a pad (undoable):
   curl -s ${base}/api/trash
   curl -s -X POST ${base}/api/trash/<id>/restore
 
-Errors are JSON: {"error": "..."} with status 400 (bad body), 403 (editing
-someone else's entry), 404 (unknown pad/entry), or 409 (If-Match version
-mismatch, or retracting an already-retracted entry).
+Errors are JSON: {"error": "..."} with status 400 (bad body, bad parameter,
+or a cursor ahead of the pad), 403 (editing someone else's entry), 404 (no
+such pad, or a pad deleted while you waited), or 409 (If-Match version
+mismatch, or retracting an already-retracted entry). Retracting an entry
+that does not exist is 400, not 404: the pad is fine, the field value is not.
 Request bodies are capped at 1 MB.
 
 Formatting
@@ -1137,24 +1183,55 @@ const server = http.createServer(async (req, res) => {
         if (sinceVersion !== null && (!Number.isInteger(sinceVersion) || sinceVersion < 0)) {
           return sendJson(res, 400, { error: 'since_version must be a non-negative integer' });
         }
+        // A cursor ahead of the pad names a version that never existed. Answering
+        // 200-with-nothing would leave such a watcher permanently convinced the
+        // pad is idle, with nothing it receives able to contradict that.
+        if (sinceVersion !== null && sinceVersion > pad.version) {
+          return sendJson(res, 400, {
+            error: `since_version ${sinceVersion} is ahead of pad ${pad.id}, which is at version ${pad.version}; your cursor is not stale, it is invalid`,
+            version: pad.version,
+          });
+        }
+        if (tail !== null && sinceVersion !== null) {
+          // Bounding a list of changes would drop changes silently, which is the
+          // failure this cursor exists to prevent. Refuse rather than truncate.
+          return sendJson(res, 400, {
+            error: 'tail cannot be combined with since_version: truncating a change list would silently drop changes. Use since_version to watch, tail to arrive.',
+          });
+        }
         if (q.get('meta') !== null) return sendJson(res, 200, padMeta(pad));
 
         if (sinceVersion !== null) {
-          const answer = (fresh) =>
-            sendJson(res, 200, { ...padMeta(fresh), since_version: sinceVersion, entries: changedSince(fresh, sinceVersion) });
+          const answer = (fresh, timedOut) =>
+            sendJson(res, 200, {
+              ...padMeta(fresh),
+              since_version: sinceVersion,
+              timedOut: Boolean(timedOut),
+              entries: changedSince(fresh, sinceVersion),
+            });
           // Long-poll: hold the request until something changes or we time out.
           // Answering immediately when the pad has already moved keeps a client
           // that is behind from sleeping on news it could have had at once.
           if (wait > 0 && pad.version <= sinceVersion) {
-            const cancel = waitForChange(pad.id, wait, () => answer(loadPad(pad.id) || pad));
+            const deadline = Date.now() + wait * 1000;
+            const cancel = waitForChange(pad.id, wait, () => {
+              // The pad may have been deleted while we held the request. Answering
+              // from the stale snapshot would report a pad that no longer exists as
+              // present and unchanged.
+              const fresh = loadPad(pad.id);
+              if (!fresh) return sendJson(res, 404, { error: `pad ${pad.id} was deleted while you were waiting` });
+              answer(fresh, Date.now() >= deadline - 50 && fresh.version <= sinceVersion);
+            });
             req.on('close', cancel);
             return;
           }
-          return answer(pad);
+          return answer(pad, false);
         }
 
-        const view = tail === null ? pad : { ...pad, entries: pad.entries.slice(-tail), tail };
-        if (q.get('format') === 'text') return sendText(res, 200, padAsText(view));
+        const entries = tail === null ? pad.entries : pad.entries.slice(-tail);
+        if (q.get('format') === 'text') return sendText(res, 200, padAsText({ ...pad, entries }));
+        const view = publicPad(pad, entries);
+        if (tail !== null) view.tail = tail;
         return sendJson(res, 200, view);
       }
       if (req.method === 'PATCH') {
@@ -1199,12 +1276,21 @@ const server = http.createServer(async (req, res) => {
         if (!Number.isInteger(want) || want < 0) {
           return sendJson(res, 400, { error: 'If-Match must be the pad version you last read, e.g. If-Match: 42' });
         }
+        if (want > pad.version) {
+          return sendJson(res, 400, {
+            error: `If-Match ${want} is ahead of pad ${pad.id}, which is at version ${pad.version}; that version never existed`,
+            version: pad.version,
+          });
+        }
         if (pad.version !== want) {
           const missed = changedSince(pad, want);
           const brief = url.searchParams.get('brief') !== null;
           return sendJson(res, 409, {
             error: `pad moved from version ${want} to ${pad.version} since you read it; nothing was appended`,
-            advice: 're-read and re-decide. Do NOT re-post automatically: if this was an action announcement, one of the entries below may be the reason not to act.',
+            cause: missed.length ? 'entries were added or changed' : 'a pad-level change with no entry behind it, such as a rename or a restore',
+            advice: missed.length
+              ? 're-read and re-decide. Do NOT re-post automatically: if this was an action announcement, one of the entries below may be the reason not to act.'
+              : 'no entry changed, so there is nothing here to re-decide against. Re-read the pad, then retry with the version below.',
             version: pad.version,
             missed: brief
               ? missed.map((e) => ({ seq: e.seq, author: e.author, version: e.version, chars: e.text.length }))
