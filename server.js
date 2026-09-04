@@ -371,7 +371,7 @@ const CSS = `
   color: var(--fg); border: 1px solid var(--border); padding: 0.3rem 0.55rem; }
 body { position: relative; }
 * { box-sizing: border-box; }
-body { margin: 0 auto; max-width: 780px; padding: 2rem 1rem 4rem; background: var(--bg);
+body { margin: 0 auto; max-width: 780px; padding: 2rem 1rem 5.5rem; background: var(--bg);
   color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
@@ -400,6 +400,13 @@ button.danger:hover { border-color: #b91c1c; filter: none; }
 .composer .bar input { width: 11rem; }
 .composer .bar button[type=submit] { margin-left: auto; }
 .footer-row { display: flex; justify-content: flex-end; margin-top: 2rem; }
+#jumpBtn { position: fixed; right: 1rem; bottom: calc(1rem + env(safe-area-inset-bottom));
+  width: 2.9rem; height: 2.9rem; border-radius: 50%; font-size: 1.1rem; line-height: 1;
+  background: var(--card); color: var(--fg); border: 1px solid var(--border);
+  box-shadow: 0 2px 10px rgba(0,0,0,0.18); opacity: 0.92; padding: 0;
+  transition: opacity 0.15s; }
+#jumpBtn[hidden] { display: none; }
+@media (hover: hover) { #jumpBtn:hover { opacity: 1; filter: none; } }
 .editbtn { background: none; border: 1px solid var(--border); color: var(--muted);
   font-size: 0.75rem; padding: 0.05rem 0.45rem; margin-left: 0.4rem; }
 .editbtn:hover { color: var(--fg); filter: none; }
@@ -512,6 +519,7 @@ curl -s -X POST ${base}/api/pads/${pad.id}/entries \\
       onsubmit="return confirm('Delete this pad and all its entries?')">
       <button type="submit" class="danger">Delete pad</button>
     </form>
+    <button id="jumpBtn" type="button" hidden aria-label="Jump to the newest entry">↓</button>
     <script>
     document.querySelectorAll('.editbtn[data-seq]').forEach((b) => {
       b.onclick = () => {
@@ -541,6 +549,26 @@ curl -s -X POST ${base}/api/pads/${pad.id}/entries \\
         if (JSON.stringify(now) !== JSON.stringify(rendered)) location.reload();
       } catch {}
     }, 3000);
+    // Long pads are tedious to scroll on a phone: one button that jumps to the
+    // composer at the bottom, and back to the top once you are there.
+    const jump = document.getElementById('jumpBtn');
+    const composer = document.querySelector('form.composer:not(.editform)');
+    let atBottom = false;
+    const sync = () => {
+      const room = document.documentElement.scrollHeight - innerHeight;
+      if (room < 400) return void (jump.hidden = true);
+      atBottom = scrollY > room - 120;
+      jump.hidden = false;
+      jump.textContent = atBottom ? '\u2191' : '\u2193';
+      jump.setAttribute('aria-label', atBottom ? 'Back to top' : 'Jump to the newest entry');
+    };
+    jump.onclick = () => {
+      if (atBottom) scrollTo({ top: 0, behavior: 'smooth' });
+      else (composer || document.body).scrollIntoView({ block: 'end', behavior: 'smooth' });
+    };
+    addEventListener('scroll', sync, { passive: true });
+    addEventListener('resize', sync);
+    sync();
     </script>`
   );
 }
