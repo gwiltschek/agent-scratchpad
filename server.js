@@ -273,6 +273,14 @@ function apiEditEntry(res, pad, seq, body) {
   sendJson(res, 200, entry);
 }
 
+function apiRenamePad(res, pad, body) {
+  const title = typeof body.title === 'string' ? body.title.trim().slice(0, 200) : '';
+  if (!title) return sendJson(res, 400, { error: 'body must be {"title": "..."} with a non-empty title' });
+  pad.title = title;
+  savePad(pad);
+  sendJson(res, 200, { id: pad.id, title: pad.title, url: `/pad/${pad.id}` });
+}
+
 // ---------- usage doc ----------
 
 function usageDoc(base) {
@@ -318,6 +326,12 @@ Edit one of YOUR OWN entries (author must match the entry's author, else 403):
   curl -s -X PUT ${base}/api/pads/<id>/entries/<seq> \\
        -H 'Content-Type: application/json' \\
        -d '{"author": "my-agent-name", "text": "updated text"}'
+
+Rename a pad (titles are not owned; any client may rename):
+  curl -s -X PATCH ${base}/api/pads/<id> \\
+       -H 'Content-Type: application/json' \\
+       -d '{"title": "new title"}'
+  -> 200 {"id": ..., "title": ..., "url": ...}
 
 Delete a pad:
   curl -s -X DELETE ${base}/api/pads/<id>
@@ -472,7 +486,12 @@ function padPage(pad, base) {
     .join('\n');
   return page(
     pad.title,
-    `<h2 style="margin-bottom:0.2rem">${esc(pad.title)}</h2>
+    `<h2 style="margin-bottom:0.2rem">${esc(pad.title)}<button type="button" class="editbtn"
+      id="titlebtn">rename</button></h2>
+    <form class="inline editform" id="titleform" method="post" action="/pad/${pad.id}/title" hidden>
+      <input name="title" value="${esc(pad.title)}" maxlength="200" required style="flex:1">
+      <button type="submit">Save title</button>
+    </form>
     <p class="muted">pad <code>${pad.id}</code> · created ${esc(pad.created)}</p>
     <div id="entries">${entriesHtml || '<p class="muted">No entries yet.</p>'}</div>
     <form method="post" action="/pad/${pad.id}/append" class="composer">
@@ -494,13 +513,18 @@ curl -s -X POST ${base}/api/pads/${pad.id}/entries \\
       <button type="submit" class="danger">Delete pad</button>
     </form>
     <script>
-    document.querySelectorAll('.editbtn').forEach((b) => {
+    document.querySelectorAll('.editbtn[data-seq]').forEach((b) => {
       b.onclick = () => {
         const f = document.getElementById('ef' + b.dataset.seq);
         f.hidden = !f.hidden;
         if (!f.hidden) f.querySelector('textarea').focus();
       };
     });
+    document.getElementById('titlebtn').onclick = () => {
+      const f = document.getElementById('titleform');
+      f.hidden = !f.hidden;
+      if (!f.hidden) f.querySelector('input').select();
+    };
     // Live-refresh entries so you can watch agents write (paused while editing).
     const rendered = ${JSON.stringify(pad.entries.map((e) => [e.seq, e.updated || e.created]))};
     setInterval(async () => {
@@ -513,6 +537,7 @@ curl -s -X POST ${base}/api/pads/${pad.id}/entries \\
         if (!r.ok) return;
         const p = await r.json();
         const now = p.entries.map((e) => [e.seq, e.updated || e.created]);
+        if (p.title !== ${JSON.stringify(pad.title).replace(/</g, '\\u003c')}) return location.reload();
         if (JSON.stringify(now) !== JSON.stringify(rendered)) location.reload();
       } catch {}
     }, 3000);
@@ -563,6 +588,9 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'GET') {
         if (url.searchParams.get('format') === 'text') return sendText(res, 200, padAsText(pad));
         return sendJson(res, 200, pad);
+      }
+      if (req.method === 'PATCH') {
+        return apiRenamePad(res, pad, await readJsonBody(req));
       }
       if (req.method === 'DELETE') {
         fs.unlinkSync(padPath(pad.id));
@@ -617,6 +645,18 @@ const server = http.createServer(async (req, res) => {
           created: new Date().toISOString(),
           updated: null,
         });
+        savePad(pad);
+      }
+      res.writeHead(303, { Location: `/pad/${pad.id}` });
+      return res.end();
+    }
+    if ((match = m(/^\/pad\/([a-z0-9]{8})\/title$/)) && req.method === 'POST') {
+      const form = parseForm(await readBody(req));
+      const pad = loadPad(match[1]);
+      if (!pad) return sendHtml(res, 404, page('not found', '<p>No such pad.</p>'));
+      const title = (form.title || '').trim().slice(0, 200);
+      if (title) {
+        pad.title = title;
         savePad(pad);
       }
       res.writeHead(303, { Location: `/pad/${pad.id}` });
