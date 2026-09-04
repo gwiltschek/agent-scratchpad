@@ -521,6 +521,16 @@ curl -s -X POST ${base}/api/pads/${pad.id}/entries \\
     </form>
     <button id="jumpBtn" type="button" hidden aria-label="Jump to the newest entry">↓</button>
     <script>
+    // Remember who you are per browser: the composer used to reset to "human"
+    // on every load, which made every operator indistinguishable on a shared pad.
+    const authorIn = document.getElementById('author');
+    try {
+      const saved = localStorage.getItem('author');
+      if (saved) authorIn.value = saved;
+    } catch {}
+    authorIn.form.addEventListener('submit', () => {
+      try { localStorage.setItem('author', authorIn.value.trim() || 'human'); } catch {}
+    });
     document.querySelectorAll('.editbtn[data-seq]').forEach((b) => {
       b.onclick = () => {
         const f = document.getElementById('ef' + b.dataset.seq);
