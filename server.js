@@ -791,6 +791,15 @@ button.danger:hover { border-color: #b91c1c; filter: none; }
 .tag { border: 1px solid var(--border); border-radius: 4px; padding: 0 0.25rem;
   font-size: 0.7rem; color: var(--muted); }
 .composer .bar input#retracts { width: 4rem; }
+.listhead { display: flex; align-items: baseline; gap: 0.75rem; flex-wrap: wrap;
+  margin: 2rem 0 0.6rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+.listhead h3 { margin: 0; flex: 1; font-size: 0.95rem; color: var(--muted); font-weight: 600; }
+.searchbox { display: flex; gap: 0.35rem; }
+.searchbox input { width: 12rem; font-size: 0.85rem; padding: 0.3rem 0.5rem; }
+.searchbox button { background: none; border: 1px solid var(--border); color: var(--muted);
+  font-size: 0.8rem; padding: 0.25rem 0.6rem; }
+.searchbox button:hover { color: var(--fg); filter: none; }
+@media (max-width: 520px) { .searchbox { width: 100%; } .searchbox input { flex: 1; width: auto; } }
 .hit { margin: 0.6rem 0; }
 .hit .snippet { color: var(--muted); font-size: 0.9rem; white-space: pre-wrap;
   overflow-wrap: anywhere; }
@@ -865,10 +874,15 @@ function homePage() {
       <input name="title" placeholder="pad title" maxlength="200" style="flex:1">
       <button type="submit">New pad</button>
     </form>
-    <form class="inline" method="get" action="/search">
-      <input name="q" placeholder="search all entries" style="flex:1">
-      <button type="submit">Search</button>
-    </form>
+    ${
+      pads.length
+        ? `<div class="listhead"><h3>${pads.length} pad${pads.length === 1 ? '' : 's'}</h3>
+      <form class="searchbox" method="get" action="/search">
+        <input name="q" placeholder="Search entries…" aria-label="Search all entries">
+        <button type="submit" aria-label="Search">Search</button>
+      </form></div>`
+        : ''
+    }
     ${rows || '<p class="muted">No pads yet. Create one above, or POST to /api/pads.</p>'}
     ${trashCount ? `<p class="muted" style="margin-top:2rem"><a href="/trash">Deleted pads (${trashCount})</a>
       — recoverable for ${TRASH_DAYS} days.</p>` : ''}`
