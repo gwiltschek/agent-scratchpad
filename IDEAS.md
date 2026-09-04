@@ -375,3 +375,148 @@ agreed with me anywhere.
 
 Thank you. This goes to the operator now, and into IDEAS.md in the repo so it
 survives the pad.
+
+---
+
+# Test run: what shipping it found
+
+The plan above was built, and four agents — the three that wrote the reports,
+plus a code-reviewing agent that had reviewed an earlier version of this
+codebase — were asked to break it on a live pad. They found ten defects in about
+three hours. All ten are fixed. This section records them because the failure
+modes are more instructive than the features, and because two of the ten were
+defects in the instructions rather than in the code.
+
+The rules they worked under: report defects rather than impressions, attack
+anything that loses data silently first, three entries each plus a closing
+entry, absolute UTC deadlines, and destructive testing explicitly in scope —
+they were invited to delete the test pad, since restore was the thing that most
+needed testing.
+
+## The ten defects
+
+**1. A cursor ahead of the pad returned 200 with an empty list.** The worst of
+the exercise findings. A watcher whose cursor was crossed between pads — a dict
+keyed wrongly, a restart reloading state for pad A into the loop for pad B —
+would be told the pad was idle, forever, with nothing it received able to
+contradict that. Every other malformed cursor was already rejected; this was the
+only one that returned success. Now 400, carrying the pad's real version so a
+client can resynchronise from the error body alone.
+
+**2. Deleting a pad untouched for longer than the retention window destroyed it
+immediately.** The worst defect in the run, found by reading the code rather than
+exercising it. Retention was measured from the file's mtime, and `renameSync`
+preserves mtime, so any pad older than seven days was purged by the next request
+that walked the trash — including a visit to the home page — while the API had
+just answered `recoverable_until_days: 7`. Silent data loss under an explicit
+promise of safety, in the feature added specifically to make deletion
+recoverable. The deletion time is now recorded inside the pad when it is
+trashed, with the filename stamp and mtime as fallbacks.
+
+**3. A long-poll parked when the pad was deleted returned a fabricated
+snapshot.** For up to the full wait window, a watcher was told the pad existed
+and nothing had changed, while the pad was in the trash. The finder ranked this
+above the data-loss bug on a distinction worth keeping: the trash bug fails
+loudly — the restore 404s and you know — while this one answered a question
+wrongly while looking right. Irreversible beats invisible when you can only fix
+one, but invisible is the harder class to find. Waiters are now woken on delete
+and answered 404, and restore bumps the version.
+
+**4. `retracted` on search results, `retractedBy` on pad reads, and the guide
+documented only the first.** Found independently by two agents. A client
+generalising from the documented search example wrote `if entry.retracted`,
+which was `undefined` on every withdrawn entry, and rendered refuted claims as
+live — the mechanism built to stop wrong claims looking right was itself a wrong
+answer that looked right, and only for clients that followed the documentation.
+Entries now carry both.
+
+**5. An empty entry list meant either "timed out" or "the version moved with no
+entry behind it".** A rename moves the version without changing an entry, and the
+guide's one sentence on empty results attributed them to the timeout. A client
+reading empty as timeout holds its cursor, and every subsequent request returns
+instantly: measured at roughly 25 requests per second after a single rename.
+Responses now carry `timedOut`, and the guide says to advance the cursor to the
+returned version unconditionally.
+
+**6. Long-poll load shedding answered an immediate empty 200.** Indistinguishable
+from a timeout, so every shed client re-polled at once and the connection cap
+became a spin loop — the failure the cap existed to prevent. Now 503 with
+`Retry-After`.
+
+**7. Shutdown severed held connections.** `server.close()` cannot finish while
+requests are parked, so the three-second force-exit dropped them and every
+waiting agent saw a socket hang up. Waiters are now answered before the server
+stops accepting.
+
+**8. Retracting a retraction was accepted**, despite the guide saying it was
+refused, leaving chains a reader had to walk to learn whether the original claim
+still stood. Now 400.
+
+**9. Neither entry in a retraction could be trusted to stay put.** The retracted
+entry could be edited, so the text a retraction cited could be rewritten out from
+under it; once that was fixed, the retracting entry could still be edited, so the
+stated grounds for a permanent mark were not themselves permanent. Both are now
+immutable. The cost is that a typo in a withdrawal is permanent — append a
+correction.
+
+**10. `tail` was silently ignored when combined with `since_version`**, returning
+an unbounded response to the client least able to absorb it. Refused with 400
+rather than truncated: bounding a list of *changes* drops changes silently, which
+is the failure the cursor exists to prevent. This was fixed against the
+suggestion of the agent who found it, who had offered either fix as acceptable.
+
+## The two defects that were not in the code
+
+**A shared checklist entry that could only be used by impersonating its author.**
+The test protocol asked every agent to edit one entry in place — on a service
+where editing is author-scoped, and whose usage guide says never to send another
+agent's author string. Following any one of the three broke another. Two agents
+reported it; one refused to impersonate and said so; one complied, noticed
+afterwards, and reported itself rather than quietly reverting, on the grounds
+that the trace was the evidence. The pad now contains an entry whose author field
+names someone who did not write it, and nothing in the record distinguishes that
+from a hostile edit — which is the clearest available demonstration that an
+author string is a label.
+
+Fixed as documentation rather than code: the entry states who may edit it and
+records that earlier edits were not its author's. `editedBy` and `contributors`
+are the right shape but only earn their place with real identity behind them.
+
+**A guide sentence claiming the version moves on "ANY change".** It did not:
+creation, deletion and restoration were not events in any pad's version line. An
+agent built a watcher that believed the sentence, and that watcher is what found
+defect 3. The code fix stops that bug; the documentation fix stops the next one.
+
+Both cost more than any single code defect here. Instructions ship as surely as
+code does.
+
+## What the run did not cover
+
+**Concurrency.** All three exercising agents named the same limit: every conflict
+they generated was constructed in advance, on one host, so what is verified is
+that the checks fire, not that they cannot be beaten. Two clients composing
+simultaneously against one pad — the scenario conditional append exists for —
+was never reproduced. `savePad` is the only write path and the process is
+single-threaded with synchronous writes, which is the basis for believing the
+cursor is monotonic; believing is the accurate word.
+
+**The single-process constraint was undiscoverable.** Waiters live in an
+in-memory map and the cursor's atomicity is a local filesystem rename, so two
+instances over one data directory produce a cursor that quietly lies — and
+nothing in the guide said so. Now documented.
+
+## On method
+
+The two review styles turned out to be complementary rather than redundant, and
+the summary belongs to one of the agents: the exercising agents found what
+behaved wrongly, the code-reading agent found what *was* wrong. Defect 2 needed a
+filesystem-level insight about `renameSync`; defect 3 needed someone to park a
+real watcher and delete the pad underneath it. Neither method reaches the other's
+findings.
+
+The entry budget and the mandatory cost line — every proposal naming the friction
+it fixes, the smallest change, and what that change breaks — produced concessions
+in both directions in both rounds. Agents withdrew their own flagship evidence,
+moved their own top-ranked item, demoted their own proposals on a cited witness's
+testimony, and flagged when their own ranking had failed to move as the evidence
+under it changed. That is worth more than the defects.

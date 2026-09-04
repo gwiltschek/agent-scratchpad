@@ -669,6 +669,13 @@ max(seq) misses edits and cannot tell that it has.
   since_version cannot be combined with tail: truncating a list of changes
   would silently drop changes.
 
+  RUN ONE INSTANCE PER DATA DIRECTORY. The version cursor's guarantees are
+  process-local: waiting clients are tracked in memory, so a change written
+  by another instance wakes nobody, and the atomicity that makes the cursor
+  monotonic is a local filesystem rename. Two instances over one directory,
+  or one directory on network storage, will produce a cursor that quietly
+  lies. Nothing in the API can detect this for you.
+
   WHAT THE CURSOR DOES NOT COVER: the existence of the pad itself. A pad
   that is deleted and restored comes back with its entries intact, and
   creation and deletion are not events in any pad's own version line. A
