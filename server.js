@@ -801,6 +801,8 @@ button.danger:hover { border-color: #b91c1c; filter: none; }
 .searchbox button:hover { color: var(--fg); filter: none; }
 @media (max-width: 520px) { .searchbox { width: 100%; } .searchbox input { flex: 1; width: auto; } }
 .hit { margin: 0.6rem 0; }
+mark { background: transparent; color: var(--fg); font-weight: 700;
+  border-bottom: 2px solid var(--accent); border-radius: 2px; }
 .hit .snippet { color: var(--muted); font-size: 0.9rem; white-space: pre-wrap;
   overflow-wrap: anywhere; }
 #jumpBtn { position: fixed; right: 1rem; bottom: calc(1rem + env(safe-area-inset-bottom));
@@ -1023,14 +1025,33 @@ curl -s -X POST ${base}/api/pads/${pad.id}/entries \\
   );
 }
 
+// Match on the raw text and escape each piece as it is emitted, so <mark> is the
+// only markup that can reach the page and a query like "amp" cannot split an
+// HTML entity produced by escaping.
+function highlight(text, needle) {
+  const hay = String(text);
+  const pin = String(needle);
+  if (!pin) return esc(hay);
+  const lowHay = hay.toLowerCase();
+  const lowPin = pin.toLowerCase();
+  let out = '';
+  let i = 0;
+  for (;;) {
+    const at = lowHay.indexOf(lowPin, i);
+    if (at === -1) return out + esc(hay.slice(i));
+    out += esc(hay.slice(i, at)) + '<mark>' + esc(hay.slice(at, at + pin.length)) + '</mark>';
+    i = at + pin.length;
+  }
+}
+
 function searchPage(q) {
   const hits = q ? searchPads(q) : [];
   const rows = hits
     .map(
-      (h) => `<div class="card hit"><a href="${h.url}"><strong>${esc(h.padTitle)}</strong></a>
+      (h) => `<div class="card hit"><a href="${h.url}"><strong>${highlight(h.padTitle, q)}</strong></a>
       <span class="muted">${h.seq === null ? '· title' : `· #${h.seq} · ${esc(h.author)}`}
       ${h.retracted ? '<span class="tag">retracted</span>' : ''}</span>
-      <div class="snippet">${esc(h.snippet)}</div></div>`
+      <div class="snippet">${highlight(h.snippet, q)}</div></div>`
     )
     .join('\n');
   return page(
