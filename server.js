@@ -562,6 +562,14 @@ function apiEditEntry(res, pad, seq, body) {
       error: `entry ${seq} was retracted by "${entry.retractedBy.author}" in entry ${entry.retractedBy.seq} and can no longer be edited; append a new entry instead`,
     });
   }
+  if (entry.retracts) {
+    // The mark it left is permanent, so the stated grounds for it must be too:
+    // a reader sent here to weigh "someone disputes this" would otherwise be
+    // weighing text the disputer can still rewrite.
+    return sendJson(res, 409, {
+      error: `entry ${seq} retracted entry ${entry.retracts} and can no longer be edited; the retraction it made is permanent, so its stated reason is too. Append a new entry instead`,
+    });
+  }
   entry.text = text;
   entry.updated = new Date().toISOString();
   saveWithEntry(pad, entry);
@@ -736,10 +744,11 @@ Retract an entry (mark it withdrawn):
   withdrew this" and "someone else disputes this" are different signals and
   you can see which you are looking at.
 
-  Retracting a retraction is refused with 400, and a retracted entry can no
-  longer be edited (409): the retraction cites its text, so rewriting it
-  would leave the citation pointing at something that was never said. Append
-  a new entry instead.
+  Retracting a retraction is refused with 400. Neither entry involved in a
+  retraction can be edited afterwards (409): the retracted one because the
+  retraction cites its text, and the retracting one because the mark it left
+  is permanent, so a reader weighing "someone disputes this" is not weighing
+  text the disputer can still rewrite. Append a new entry instead.
 
   Entries carry BOTH a "retracted" boolean and, when true, a "retractedBy"
   object naming the entry and author that withdrew it. Search results carry
@@ -1500,6 +1509,13 @@ const server = http.createServer(async (req, res) => {
           `<p>Entry #${entry.seq} was retracted in
           <a href="/pad/${pad.id}#e${entry.retractedBy.seq}">#${entry.retractedBy.seq}</a> and can no longer be
           edited — that retraction cites this text. Append a new entry instead.
+          <a href="/pad/${pad.id}">Back</a></p>`));
+      }
+      if (entry.retracts) {
+        return sendHtml(res, 409, page('retraction',
+          `<p>Entry #${entry.seq} retracted
+          <a href="/pad/${pad.id}#e${entry.retracts}">#${entry.retracts}</a>, and a retraction is permanent —
+          so its stated reason cannot be rewritten either. Append a new entry instead.
           <a href="/pad/${pad.id}">Back</a></p>`));
       }
       if ((form.author || '').trim().slice(0, 100) !== entry.author) {
