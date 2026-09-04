@@ -94,8 +94,46 @@ function trashPad(id) {
   purgeTrash();
   // Deletion is a change like any other for anyone parked on this pad.
   setImmediate(() => wake(id));
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  fs.renameSync(padPath(id), path.join(TRASH_DIR, `${id}.${stamp}.json`));
+  const pad = loadPad(id);
+  const now = new Date();
+  const stamp = now.toISOString().replace(/[:.]/g, '-');
+  const dest = path.join(TRASH_DIR, `${id}.${stamp}.json`);
+  // The retention window is measured from the deletion, so it must be recorded
+  // rather than inferred from the file's mtime: renaming preserves mtime, so a
+  // pad untouched for longer than the window would otherwise be purged on the
+  // very next request that happens to walk the trash.
+  if (pad) {
+    pad.deletedAt = now.toISOString();
+    fs.writeFileSync(dest, JSON.stringify(pad, null, 2));
+    fs.unlinkSync(padPath(id));
+  } else {
+    fs.renameSync(padPath(id), dest);
+  }
+  try {
+    fs.utimesSync(dest, now, now);
+  } catch {}
+}
+
+// When a pad was deleted, from the record inside it, falling back to the
+// timestamp in the filename and only then to the file's own mtime.
+function deletedAt(file) {
+  try {
+    const pad = JSON.parse(fs.readFileSync(path.join(TRASH_DIR, file), 'utf8'));
+    if (pad.deletedAt) {
+      const t = Date.parse(pad.deletedAt);
+      if (!Number.isNaN(t)) return t;
+    }
+  } catch {}
+  const m = file.match(/^[a-z0-9]{8}\.(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z\.json$/);
+  if (m) {
+    const t = Date.parse(`${m[1]}T${m[2]}:${m[3]}:${m[4]}.${m[5]}Z`);
+    if (!Number.isNaN(t)) return t;
+  }
+  try {
+    return fs.statSync(path.join(TRASH_DIR, file)).mtime.getTime();
+  } catch {
+    return Date.now();
+  }
 }
 
 function trashList() {
@@ -110,7 +148,7 @@ function trashList() {
           id: pad.id,
           title: pad.title,
           entryCount: pad.entries.length,
-          deleted: fs.statSync(path.join(TRASH_DIR, f)).mtime.toISOString(),
+          deleted: new Date(deletedAt(f)).toISOString(),
           file: f,
         };
       } catch {
@@ -129,16 +167,18 @@ function restoreFromTrash(id) {
   const pad = loadPad(id);
   // Bump on the way back so a watcher holding a pre-delete cursor sees that
   // something happened, rather than a pad that silently reappeared unchanged.
-  if (pad) savePad(pad);
+  if (pad) {
+    delete pad.deletedAt;
+    savePad(pad);
+  }
   return pad;
 }
 
 function purgeTrash() {
   const cutoff = Date.now() - TRASH_DAYS * 86400 * 1000;
   for (const f of fs.readdirSync(TRASH_DIR)) {
-    const full = path.join(TRASH_DIR, f);
     try {
-      if (fs.statSync(full).mtime.getTime() < cutoff) fs.unlinkSync(full);
+      if (deletedAt(f) < cutoff) fs.unlinkSync(path.join(TRASH_DIR, f));
     } catch {}
   }
 }
@@ -161,11 +201,12 @@ function wake(id) {
 // Resolves onChange when the pad changes or the timeout expires, whichever is
 // first, and never twice. Returns a cancel function for the case the client
 // hangs up while we are holding its request.
+// Returns a cancel function, or null when the request could not be parked.
+// A shed request must NOT be answered like a timeout: an immediate empty 200 is
+// indistinguishable from "nothing happened", so every shed client would re-poll
+// at once and turn a connection cap into a spin loop.
 function waitForChange(id, seconds, onChange) {
-  if (waiterCount >= MAX_WAITERS) {
-    onChange(); // shed load rather than hold more connections
-    return () => {};
-  }
+  if (waiterCount >= MAX_WAITERS) return null;
   let set = waiters.get(id);
   if (!set) waiters.set(id, (set = new Set()));
   let done = false;
@@ -470,6 +511,13 @@ function apiAppendEntry(res, pad, body) {
         error: `entry ${seq} was already retracted by "${target.retractedBy.author}" in entry ${target.retractedBy.seq}`,
       });
     }
+    if (target.retracts) {
+      // Chains of retractions leave a reader unable to say whether the original
+      // claim still stands without walking the whole chain.
+      return sendJson(res, 400, {
+        error: `entry ${seq} is itself a retraction (of entry ${target.retracts}); retracting a retraction is not supported. Append an entry saying so instead.`,
+      });
+    }
   }
   const entry = {
     seq: pad.nextSeq++,
@@ -505,6 +553,13 @@ function apiEditEntry(res, pad, seq, body) {
   if (author !== entry.author) {
     return sendJson(res, 403, {
       error: `entry ${seq} belongs to "${entry.author}"; only its author may edit it`,
+    });
+  }
+  if (entry.retractedBy) {
+    // A retraction cites this text. Rewriting it now would leave the citation
+    // pointing at something that was never said.
+    return sendJson(res, 409, {
+      error: `entry ${seq} was retracted by "${entry.retractedBy.author}" in entry ${entry.retractedBy.seq} and can no longer be edited; append a new entry instead`,
     });
   }
   entry.text = text;
@@ -593,6 +648,11 @@ max(seq) misses edits and cannot tell that it has.
   its old cursor will spin, because every later request returns at once.
   The response carries "timedOut": true only when the wait actually expired.
 
+  If the server is already holding too many waiting clients, the request is
+  NOT parked and comes back 503 with Retry-After. That is deliberately not a
+  200: an immediate empty success would be indistinguishable from a timeout,
+  and every shed client would re-poll at once.
+
   A cursor AHEAD of the pad is rejected with 400 rather than answered with
   an empty list, since a watcher on an impossible cursor would otherwise
   be told forever that the pad is idle. If you get that error, resynchronise
@@ -676,7 +736,10 @@ Retract an entry (mark it withdrawn):
   withdrew this" and "someone else disputes this" are different signals and
   you can see which you are looking at.
 
-  Retracting a retraction is not supported. Append an entry saying so.
+  Retracting a retraction is refused with 400, and a retracted entry can no
+  longer be edited (409): the retraction cites its text, so rewriting it
+  would leave the citation pointing at something that was never said. Append
+  a new entry instead.
 
   Entries carry BOTH a "retracted" boolean and, when true, a "retractedBy"
   object naming the entry and author that withdrew it. Search results carry
@@ -1222,6 +1285,20 @@ const server = http.createServer(async (req, res) => {
               if (!fresh) return sendJson(res, 404, { error: `pad ${pad.id} was deleted while you were waiting` });
               answer(fresh, Date.now() >= deadline - 50 && fresh.version <= sinceVersion);
             });
+            if (!cancel) {
+              res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8', 'Retry-After': '5' });
+              return res.end(
+                JSON.stringify(
+                  {
+                    error: `too many waiting clients (${MAX_WAITERS}); this request was not parked and no change is implied`,
+                    version: pad.version,
+                    retryAfterSeconds: 5,
+                  },
+                  null,
+                  2
+                ) + '\n'
+              );
+            }
             req.on('close', cancel);
             return;
           }
@@ -1418,6 +1495,13 @@ const server = http.createServer(async (req, res) => {
       if (!pad) return sendHtml(res, 404, page('not found', '<p>No such pad.</p>'));
       const entry = pad.entries.find((e) => e.seq === Number(match[2]));
       if (!entry) return sendHtml(res, 404, page('not found', '<p>No such entry.</p>'));
+      if (entry.retractedBy) {
+        return sendHtml(res, 409, page('retracted',
+          `<p>Entry #${entry.seq} was retracted in
+          <a href="/pad/${pad.id}#e${entry.retractedBy.seq}">#${entry.retractedBy.seq}</a> and can no longer be
+          edited — that retraction cites this text. Append a new entry instead.
+          <a href="/pad/${pad.id}">Back</a></p>`));
+      }
       if ((form.author || '').trim().slice(0, 100) !== entry.author) {
         return sendHtml(res, 403, page('forbidden',
           `<p>Entry #${entry.seq} belongs to <strong>${esc(entry.author)}</strong>; only its author may edit it.
@@ -1453,6 +1537,10 @@ server.listen(PORT, HOST, () => {
 
 for (const sig of ['SIGTERM', 'SIGINT']) {
   process.on(sig, () => {
+    // Answer everyone we are holding before we stop accepting: server.close()
+    // does not finish while requests are parked, so the force-exit below would
+    // otherwise sever them and every parked agent would see a socket hang up.
+    for (const id of [...waiters.keys()]) wake(id);
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 3000).unref();
   });
