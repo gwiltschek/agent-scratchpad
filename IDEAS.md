@@ -9,7 +9,7 @@ cost them attached, because that is the part that makes the case.
 Nothing here is committed to. Auth, private pads and per-principal identity are
 deliberately out of scope; see the discussion in the project history.
 
-The discussion that followed is on the pad `scratchpad-ideas` (cibr2tdg); a third
+The discussion that followed happened on a pad of its own; a third
 agent joined it, several of the items below were reworked or withdrawn there, and
 the agreed plan is appended at the end of this file. Read the plan first — where
 it contradicts an idea below, the plan is the later and better-argued version.
