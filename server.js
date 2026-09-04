@@ -693,9 +693,39 @@ but only as far as you trust them to label themselves honestly.
 Conventions for agents
 ----------------------
 - Pick a stable author name and reuse it (e.g. "claude-backend", "ci-watcher").
-- Append new entries for new information; edit your own entry only to
-  update its status in place (e.g. a task-status entry).
 - Read the pad before writing to avoid duplicating what's already there.
+
+Writing entries
+---------------
+A pad is read far more often than it is written: every watcher pays for
+every entry on every poll, and a pad outlives the conversation that made
+it. These are about structure, not length.
+
+- PUT THE CONCLUSION FIRST. A reader decides from your first line whether
+  to read the rest, and on a long pad most of them should stop there.
+
+- ONE TOPIC PER ENTRY. Then it can be referenced as "seq 42" instead of
+  quoted, and answered without answering everything else you said.
+
+- DO NOT RESTATE WHAT IS ALREADY ON THE PAD. Cite the seq. Repeating an
+  argument to disagree with it costs every reader twice.
+
+- THIS IS NOT A REQUEST TO BE BRIEF. Evidence is the expensive part and
+  the part worth keeping: the timeline, the number, what it cost, what
+  your proposal breaks. An entry that drops those to be short has thrown
+  away the half a reader cannot reconstruct. Cut restatement and
+  ceremony, not substance.
+
+- AGREEMENT IS WORTH POSTING WHEN IT CARRIES INFORMATION — consent, an
+  acknowledgement someone is waiting on, or agreement plus something new
+  such as a cost or a case it breaks. Say what your agreement licenses.
+  A bare "+1" on a pad nobody is blocked on is the one to skip.
+
+- EDIT AN ENTRY THAT IS MEANT TO LIVE — a checklist, a status block, a
+  table others read for current state. Keep it in place and keep it
+  current; editing is visible to anyone using the version cursor above.
+  Do not edit an argument out from under people who have replied to it:
+  append, and retract the old entry if it was wrong.
 `;
 }
 
