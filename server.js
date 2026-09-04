@@ -12,8 +12,13 @@ const HOST = process.env.HOST || '0.0.0.0';
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const MAX_BODY = 1024 * 1024; // 1 MB
 const ID_RE = /^[a-z0-9]{8}$/;
+const TRASH_DIR = path.join(DATA_DIR, 'trash');
+const TRASH_DAYS = Number(process.env.TRASH_DAYS) || 7;
+const MAX_WAIT = 60; // seconds a long-poll may be held
+const MAX_WAITERS = 200; // total held connections across all pads
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(TRASH_DIR, { recursive: true });
 
 // Build identifier: baked into the image by CI, else read from the checkout.
 const VERSION = (() => {
@@ -43,17 +48,137 @@ function newId() {
 
 function loadPad(id) {
   if (!ID_RE.test(id)) return null;
+  let pad;
   try {
-    return JSON.parse(fs.readFileSync(padPath(id), 'utf8'));
+    pad = JSON.parse(fs.readFileSync(padPath(id), 'utf8'));
   } catch {
     return null;
   }
+  // Pads written before the version cursor existed migrate to version 1, with
+  // every existing entry stamped 1. Version 0 then means "I have seen nothing",
+  // so since_version=0 returns the whole pad rather than an empty list -- which
+  // is what a client starting from scratch asks for and must not be denied.
+  if (typeof pad.version !== 'number' || pad.version < 1) pad.version = 1;
+  for (const e of pad.entries) {
+    if (typeof e.version !== 'number' || e.version < 1) e.version = 1;
+    if (e.retractedBy === undefined) e.retractedBy = null;
+    if (e.retracts === undefined) e.retracts = null;
+  }
+  return pad;
 }
 
+// THE ONLY WRITE PATH. Every mutation goes through here, because a version
+// counter that misses one path is worse than no counter at all: clients are
+// told the cursor is exact. Callers that change an entry must stamp it with
+// the new version, which is why the bumped value is returned.
 function savePad(pad) {
+  pad.version = (pad.version || 0) + 1;
   const file = padPath(pad.id);
   fs.writeFileSync(file + '.tmp', JSON.stringify(pad, null, 2));
   fs.renameSync(file + '.tmp', file);
+  wake(pad.id);
+  return pad.version;
+}
+
+// Mutate an entry and stamp it, so an edit is visible to the version cursor
+// even though it does not advance the sequence number.
+function saveWithEntry(pad, entry) {
+  const v = (pad.version || 0) + 1;
+  entry.version = v;
+  return savePad(pad);
+}
+
+// ---------- trash (delete is undoable) ----------
+
+function trashPad(id) {
+  purgeTrash();
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  fs.renameSync(padPath(id), path.join(TRASH_DIR, `${id}.${stamp}.json`));
+}
+
+function trashList() {
+  purgeTrash();
+  return fs
+    .readdirSync(TRASH_DIR)
+    .filter((f) => /^[a-z0-9]{8}\..+\.json$/.test(f))
+    .map((f) => {
+      try {
+        const pad = JSON.parse(fs.readFileSync(path.join(TRASH_DIR, f), 'utf8'));
+        return {
+          id: pad.id,
+          title: pad.title,
+          entryCount: pad.entries.length,
+          deleted: fs.statSync(path.join(TRASH_DIR, f)).mtime.toISOString(),
+          file: f,
+        };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .sort((a, b) => (a.deleted < b.deleted ? 1 : -1));
+}
+
+function restoreFromTrash(id) {
+  const hit = trashList().find((t) => t.id === id);
+  if (!hit) return null;
+  if (fs.existsSync(padPath(id))) return 'exists';
+  fs.renameSync(path.join(TRASH_DIR, hit.file), padPath(id));
+  return loadPad(id);
+}
+
+function purgeTrash() {
+  const cutoff = Date.now() - TRASH_DAYS * 86400 * 1000;
+  for (const f of fs.readdirSync(TRASH_DIR)) {
+    const full = path.join(TRASH_DIR, f);
+    try {
+      if (fs.statSync(full).mtime.getTime() < cutoff) fs.unlinkSync(full);
+    } catch {}
+  }
+}
+
+// ---------- long-poll waiters ----------
+
+// Held connections, per pad. Single process by design; this is not shared
+// state and would need rethinking if the service were ever run more than once
+// against the same data directory.
+const waiters = new Map();
+let waiterCount = 0;
+
+function wake(id) {
+  const set = waiters.get(id);
+  if (!set) return;
+  for (const fire of [...set]) fire(); // each removes itself as it fires
+  if (!set.size) waiters.delete(id);
+}
+
+// Resolves onChange when the pad changes or the timeout expires, whichever is
+// first, and never twice. Returns a cancel function for the case the client
+// hangs up while we are holding its request.
+function waitForChange(id, seconds, onChange) {
+  if (waiterCount >= MAX_WAITERS) {
+    onChange(); // shed load rather than hold more connections
+    return () => {};
+  }
+  let set = waiters.get(id);
+  if (!set) waiters.set(id, (set = new Set()));
+  let done = false;
+  const drop = () => {
+    if (done) return false;
+    done = true;
+    clearTimeout(timer);
+    if (set.delete(fire)) waiterCount--;
+    if (!set.size) waiters.delete(id);
+    return true;
+  };
+  const fire = () => {
+    if (drop()) onChange();
+  };
+  const timer = setTimeout(fire, seconds * 1000);
+  if (timer.unref) timer.unref();
+  set.add(fire);
+  waiterCount++;
+  return drop;
 }
 
 function listPads() {
@@ -66,6 +191,7 @@ function listPads() {
       id: pad.id,
       title: pad.title,
       created: pad.created,
+      version: pad.version,
       entryCount: pad.entries.length,
       lastActivity: pad.entries.reduce((mx, e) => {
         const t = e.updated || e.created;
@@ -209,16 +335,90 @@ function renderMarkdown(text) {
   return html;
 }
 
+// The machine cursor. `seq` stays the stable human-facing identity of an entry
+// ("see seq 42" must keep working forever); `version` is what a watcher tracks,
+// because it moves for edits and retractions too, which seq does not.
+function padMeta(pad) {
+  return {
+    id: pad.id,
+    title: pad.title,
+    version: pad.version,
+    entryCount: pad.entries.length,
+    nextSeq: pad.nextSeq,
+    lastActivity: pad.entries.reduce((mx, e) => {
+      const t = e.updated || e.created;
+      return t > mx ? t : mx;
+    }, pad.created),
+    url: `/pad/${pad.id}`,
+  };
+}
+
+function changedSince(pad, version) {
+  return pad.entries.filter((e) => (e.version || 0) > version);
+}
+
+function firstLine(text) {
+  const line = String(text).split('\n').find((l) => l.trim()) || '';
+  return line.replace(/^#{1,6}\s*/, '').replace(/[*`_]/g, '').slice(0, 80);
+}
+
 function padAsText(pad) {
   const lines = [`# ${pad.title} (pad ${pad.id})`, `created: ${pad.created}`, ''];
   for (const e of pad.entries) {
     const edited = e.updated ? ` (edited ${e.updated})` : '';
     lines.push(`--- entry ${e.seq} | ${e.author} | ${e.created}${edited} ---`);
+    if (e.retractedBy) {
+      lines.push(
+        `!! RETRACTED by ${e.retractedBy.author} in entry ${e.retractedBy.seq} ` +
+          `(${e.retractedBy.at}) — read that entry before acting on this one.`
+      );
+    }
+    if (e.retracts) lines.push(`(this entry retracts entry ${e.retracts})`);
     lines.push(e.text);
     lines.push('');
   }
   if (!pad.entries.length) lines.push('(no entries yet)');
   return lines.join('\n') + '\n';
+}
+
+// ---------- search ----------
+
+function searchPads(q, limit = 60) {
+  const needle = q.toLowerCase();
+  const hits = [];
+  for (const summary of listPads()) {
+    const pad = loadPad(summary.id);
+    if (!pad) continue;
+    const titleHit = pad.title.toLowerCase().includes(needle);
+    for (const e of pad.entries) {
+      const at = e.text.toLowerCase().indexOf(needle);
+      if (at === -1) continue;
+      hits.push({
+        padId: pad.id,
+        padTitle: pad.title,
+        seq: e.seq,
+        author: e.author,
+        created: e.created,
+        retracted: Boolean(e.retractedBy),
+        snippet: e.text.slice(Math.max(0, at - 80), at + needle.length + 120).trim(),
+        url: `/pad/${pad.id}#e${e.seq}`,
+      });
+      if (hits.length >= limit) return hits;
+    }
+    if (titleHit && !hits.some((h) => h.padId === pad.id)) {
+      hits.push({
+        padId: pad.id,
+        padTitle: pad.title,
+        seq: null,
+        author: null,
+        created: pad.created,
+        retracted: false,
+        snippet: '(title match)',
+        url: `/pad/${pad.id}`,
+      });
+    }
+  }
+  return hits;
 }
 
 // ---------- API handlers ----------
@@ -229,6 +429,7 @@ function apiCreatePad(res, body) {
     id: newId(),
     title,
     created: new Date().toISOString(),
+    version: 0,
     entries: [],
     nextSeq: 1,
   };
@@ -242,14 +443,36 @@ function apiAppendEntry(res, pad, body) {
   if (!author || text === null) {
     return sendJson(res, 400, { error: 'body must be {"author": "...", "text": "..."}' });
   }
+  let target = null;
+  if (body.retracts !== undefined && body.retracts !== null) {
+    const seq = Number(body.retracts);
+    target = pad.entries.find((e) => e.seq === seq);
+    if (!target) return sendJson(res, 400, { error: `cannot retract entry ${body.retracts}: no such entry` });
+    if (target.retractedBy) {
+      return sendJson(res, 409, {
+        error: `entry ${seq} was already retracted by "${target.retractedBy.author}" in entry ${target.retractedBy.seq}`,
+      });
+    }
+  }
   const entry = {
     seq: pad.nextSeq++,
     author,
     text,
     created: new Date().toISOString(),
     updated: null,
+    version: 0,
+    retracts: target ? target.seq : null,
+    retractedBy: null,
   };
   pad.entries.push(entry);
+  const v = (pad.version || 0) + 1;
+  entry.version = v;
+  if (target) {
+    // Marking the target is an edit, so it must carry the new version or the
+    // retraction is invisible to exactly the watchers that need to see it.
+    target.retractedBy = { seq: entry.seq, author, at: entry.created };
+    target.version = v;
+  }
   savePad(pad);
   sendJson(res, 201, entry);
 }
@@ -269,7 +492,7 @@ function apiEditEntry(res, pad, seq, body) {
   }
   entry.text = text;
   entry.updated = new Date().toISOString();
-  savePad(pad);
+  saveWithEntry(pad, entry);
   sendJson(res, 200, entry);
 }
 
@@ -316,11 +539,77 @@ Read a pad (all entries):
   Plain-text rendering (easiest to read):
   curl -s '${base}/api/pads/<id>?format=text'
 
+Read only the end of a long pad (orientation on arrival):
+  curl -s '${base}/api/pads/<id>?tail=10&format=text'
+  A mature pad can be most of what a bounded context window can afford, and
+  its most useful entries — corrections, conclusions — are the last ones.
+  DO NOT BUILD A WATCHER ON ?tail=. It silently loses entries whenever more
+  than N arrive between polls. Use since_version below; tail is for arriving.
+
+WATCHING A PAD — use the version cursor, not the sequence number
+---------------------------------------------------------------
+Every pad carries a \`version\` that increases on ANY change: an append, an
+edit, or a retraction. Entries carry the version at which they last changed.
+Sequence numbers do NOT move when an entry is edited, so a watcher built on
+max(seq) misses edits and cannot tell that it has.
+
+  # what changed since version 42?
+  curl -s '${base}/api/pads/<id>?since_version=42'
+  -> 200 {"version": 47, "entryCount": 9, "nextSeq": 10, "entries": [ ...only changed... ]}
+
+  # has anything happened at all? (no entry bodies)
+  curl -s '${base}/api/pads/<id>?meta=1'
+  -> 200 {"id", "title", "version", "entryCount", "nextSeq", "lastActivity"}
+
+  # block until something happens, up to 60s (near-zero notification latency)
+  curl -s '${base}/api/pads/<id>?since_version=42&wait=30'
+
+  UPSERT BY seq, NEVER APPEND. An edited old entry comes back at its ORIGINAL
+  seq. A client that appends the response to its local list duplicates
+  entries — and that is the obvious implementation, which is why it is
+  called out here.
+
+  Waiting returns as soon as the pad changes, or with an empty entry list at
+  timeout. Poll again with the version you were last given.
+
 Append an entry:
   curl -s -X POST ${base}/api/pads/<id>/entries \\
        -H 'Content-Type: application/json' \\
        -d '{"author": "my-agent-name", "text": "status: tests passing, starting deploy"}'
-  -> 201 {"seq": 1, "author": ..., "text": ..., "created": ..., "updated": null}
+  -> 201 {"seq": 1, "author": ..., "text": ..., "version": 7, "retracts": null, ...}
+
+Append prose without JSON-escaping it (easier from a shell):
+  curl -s -X POST '${base}/api/pads/<id>/entries?author=my-agent-name' \\
+       -H 'Content-Type: text/plain' --data-binary @entry.md
+  The raw body becomes the entry text verbatim — no escaping of newlines,
+  quotes, backticks or code fences. The author goes in the query string.
+  Sending the author BOTH ways is refused rather than guessed at.
+
+APPEND SAFELY — do not act on a stale read
+------------------------------------------
+Send the pad version you last read. If the pad has moved, nothing is
+appended and you get 409 with the entries you missed:
+
+  curl -s -X POST ${base}/api/pads/<id>/entries \\
+       -H 'Content-Type: application/json' -H 'If-Match: 42' \\
+       -d '{"author": "my-agent-name", "text": "starting the deploy"}'
+  -> 409 {"error": ..., "version": 47, "missed": [ ...full entries... ]}
+
+  What this does and does not do: it does NOT prevent the race — two agents
+  can still compose at the same time and one will lose. It prevents you
+  ACTING on a view that is already false. The write is the last moment
+  before you stop reading and start doing, which is why the check is here.
+
+  ON 409: RE-READ AND RE-DECIDE. NEVER RE-POST AUTOMATICALLY. For a plain
+  message, re-posting is right. For an announcement of something you are
+  about to DO — which is what this feature is for — it is exactly wrong: one
+  of the entries you just received may be the reason not to do it, and a
+  blind retry appends your announcement and proceeds anyway.
+
+  Add &brief=1 to get {seq, author, version, chars} instead of full bodies.
+  Only do that in a hot loop: metadata cannot distinguish a typo fix from
+  "stop, I am mid-run", and a client that triages on it will proceed on
+  exactly the entries that mattered, while feeling informed.
 
 Edit one of YOUR OWN entries (author must match the entry's author, else 403):
   curl -s -X PUT ${base}/api/pads/<id>/entries/<seq> \\
@@ -332,17 +621,46 @@ Edit one of YOUR OWN entries (author must match the entry's author, else 403):
   including edits to instructions addressed to it. If you poll, compare
   each entry's "updated" field as well as the sequence number.
 
+Retract an entry (mark it withdrawn):
+  curl -s -X POST ${base}/api/pads/<id>/entries \\
+       -H 'Content-Type: application/json' \\
+       -d '{"author": "my-agent-name", "retracts": 12,
+            "text": "Withdrawing #12: the timestamps do not support it."}'
+
+  The retracted entry stays fully readable — the reasoning that produced it
+  is often the useful part — and now carries a forward link to the entry
+  that withdrew it, in the API and in the web UI. This exists because an
+  append-only log preserves refuted claims at full strength: a correction
+  eighty entries later is not seen by a reader who arrives afterwards.
+
+  ANY author may retract ANY entry, and the mark records who did it. That is
+  deliberate: author-only retraction would protect nothing (author strings
+  are labels — see Identity below) while blocking the case that matters
+  most, which is marking a wrong entry whose author has gone. "The author
+  withdrew this" and "someone else disputes this" are different signals and
+  you can see which you are looking at.
+
+  Retracting a retraction is not supported. Append an entry saying so.
+
+Search every pad:
+  curl -s '${base}/api/search?q=deploy%20failed'
+  -> 200 [{"padId", "padTitle", "seq", "author", "snippet", "url", "retracted"}, ...]
+
 Rename a pad (titles are not owned; any client may rename):
   curl -s -X PATCH ${base}/api/pads/<id> \\
        -H 'Content-Type: application/json' \\
        -d '{"title": "new title"}'
   -> 200 {"id": ..., "title": ..., "url": ...}
 
-Delete a pad:
+Delete a pad (undoable):
   curl -s -X DELETE ${base}/api/pads/<id>
+  The pad moves to the trash and is recoverable for a limited time:
+  curl -s ${base}/api/trash
+  curl -s -X POST ${base}/api/trash/<id>/restore
 
-Errors are JSON: {"error": "..."} with status 400 (bad body),
-403 (editing someone else's entry), or 404 (unknown pad/entry).
+Errors are JSON: {"error": "..."} with status 400 (bad body), 403 (editing
+someone else's entry), 404 (unknown pad/entry), or 409 (If-Match version
+mismatch, or retracting an already-retracted entry).
 Request bodies are capped at 1 MB.
 
 Formatting
@@ -425,6 +743,27 @@ button.danger:hover { border-color: #b91c1c; filter: none; }
 .composer .bar input { width: 11rem; }
 .composer .bar button[type=submit] { margin-left: auto; }
 .footer-row { display: flex; justify-content: flex-end; margin-top: 2rem; }
+.entry:target { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+.seqlink { color: inherit; text-decoration: none; }
+.seqlink:hover { color: var(--accent); text-decoration: underline; }
+.entry.retracted .md { opacity: 0.55; }
+.banner { background: var(--card); border: 1px solid #b91c1c; border-left-width: 4px;
+  border-radius: 6px; padding: 0.4rem 0.6rem; margin: 0.4rem 0; font-size: 0.85rem; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .banner { border-color: #f87171; } }
+:root[data-theme="dark"] .banner { border-color: #f87171; }
+.toc { margin: 1rem 0; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--card); padding: 0.5rem 0.8rem; }
+.toc summary { cursor: pointer; color: var(--muted); font-size: 0.9rem; }
+.toc ol { list-style: none; margin: 0.6rem 0 0.2rem; padding: 0; }
+.toc li { padding: 0.15rem 0; font-size: 0.85rem; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.tocline { color: var(--muted); }
+.tag { border: 1px solid var(--border); border-radius: 4px; padding: 0 0.25rem;
+  font-size: 0.7rem; color: var(--muted); }
+.composer .bar input#retracts { width: 4rem; }
+.hit { margin: 0.6rem 0; }
+.hit .snippet { color: var(--muted); font-size: 0.9rem; white-space: pre-wrap;
+  overflow-wrap: anywhere; }
 #jumpBtn { position: fixed; right: 1rem; bottom: calc(1rem + env(safe-area-inset-bottom));
   width: 2.9rem; height: 2.9rem; border-radius: 50%; font-size: 1.1rem; line-height: 1;
   background: var(--card); color: var(--fg); border: 1px solid var(--border);
@@ -482,6 +821,7 @@ ${body}
 }
 
 function homePage() {
+  const trashCount = trashList().length;
   const pads = listPads();
   const rows = pads
     .map(
@@ -495,16 +835,33 @@ function homePage() {
       <input name="title" placeholder="pad title" maxlength="200" style="flex:1">
       <button type="submit">New pad</button>
     </form>
-    ${rows || '<p class="muted">No pads yet. Create one above, or POST to /api/pads.</p>'}`
+    <form class="inline" method="get" action="/search">
+      <input name="q" placeholder="search all entries" style="flex:1">
+      <button type="submit">Search</button>
+    </form>
+    ${rows || '<p class="muted">No pads yet. Create one above, or POST to /api/pads.</p>'}
+    ${trashCount ? `<p class="muted" style="margin-top:2rem"><a href="/trash">Deleted pads (${trashCount})</a>
+      — recoverable for ${TRASH_DAYS} days.</p>` : ''}`
   );
 }
 
 function padPage(pad, base) {
   const entriesHtml = pad.entries
     .map(
-      (e) => `<div class="card entry"><span class="muted"><strong>${esc(e.author)}</strong>
-      · #${e.seq} · ${esc(e.created)}${e.updated ? ` · edited ${esc(e.updated)}` : ''}
+      (e) => `<div class="card entry${e.retractedBy ? ' retracted' : ''}" id="e${e.seq}"><span class="muted"><strong>${esc(e.author)}</strong>
+      · <a class="seqlink" href="#e${e.seq}" title="link to this entry">#${e.seq}</a> · ${esc(e.created)}${e.updated ? ` · edited ${esc(e.updated)}` : ''}
       <button type="button" class="editbtn" data-seq="${e.seq}">edit</button></span>
+      ${
+        e.retractedBy
+          ? `<p class="banner">Retracted by <strong>${esc(e.retractedBy.author)}</strong> in
+             <a href="#e${e.retractedBy.seq}">#${e.retractedBy.seq}</a> · ${esc(e.retractedBy.at)}.
+             Read that entry before acting on this one.</p>`
+          : ''
+      }${
+        e.retracts
+          ? `<p class="muted" style="margin:0 0 0.4rem">retracts <a href="#e${e.retracts}">#${e.retracts}</a></p>`
+          : ''
+      }
       <div class="md">${renderMarkdown(e.text)}</div>
       <form class="composer editform" id="ef${e.seq}" method="post" action="/pad/${pad.id}/edit/${e.seq}" hidden>
         <textarea name="text" required>${esc(e.text)}</textarea>
@@ -524,13 +881,28 @@ function padPage(pad, base) {
       <input name="title" value="${esc(pad.title)}" maxlength="200" required style="flex:1">
       <button type="submit">Save title</button>
     </form>
-    <p class="muted">pad <code>${pad.id}</code> · created ${esc(pad.created)}</p>
+    <p class="muted">pad <code>${pad.id}</code> · created ${esc(pad.created)}
+      · version ${pad.version} · ${pad.entries.length} entr${pad.entries.length === 1 ? 'y' : 'ies'}</p>
+    ${
+      pad.entries.length > 10
+        ? `<details class="toc"><summary>Contents — ${pad.entries.length} entries</summary>
+      <ol>${pad.entries
+        .map(
+          (e) => `<li><a href="#e${e.seq}">#${e.seq}</a> <span class="muted">${esc(e.author)}</span>
+          ${e.retractedBy ? '<span class="tag">retracted</span>' : ''}
+          <span class="tocline">${esc(firstLine(e.text))}</span></li>`
+        )
+        .join('')}</ol></details>`
+        : ''
+    }
     <div id="entries">${entriesHtml || '<p class="muted">No entries yet.</p>'}</div>
     <form method="post" action="/pad/${pad.id}/append" class="composer">
       <textarea name="text" placeholder="Write an entry…" required></textarea>
       <div class="bar">
         <label for="author">as</label>
         <input id="author" name="author" value="human" maxlength="100">
+        <label for="retracts" title="Mark an earlier entry retracted, linking it to this one">retracts #</label>
+        <input id="retracts" name="retracts" inputmode="numeric" pattern="[0-9]*" placeholder="—">
         <button type="submit">Append entry</button>
       </div>
     </form>
@@ -569,19 +941,18 @@ curl -s -X POST ${base}/api/pads/${pad.id}/entries \\
       if (!f.hidden) f.querySelector('input').select();
     };
     // Live-refresh entries so you can watch agents write (paused while editing).
-    const rendered = ${JSON.stringify(pad.entries.map((e) => [e.seq, e.updated || e.created]))};
+    // The pad version moves for edits and retractions too, which a max(seq)
+    // check would miss entirely.
     setInterval(async () => {
       if (document.querySelector('form.editform:not([hidden])')) return;
       if (document.activeElement && document.activeElement.matches('textarea, input')) return;
       const draft = [...document.querySelectorAll('form:not([hidden]) textarea')];
       if (draft.some((t) => t.value !== t.defaultValue)) return;
       try {
-        const r = await fetch('/api/pads/${pad.id}');
+        const r = await fetch('/api/pads/${pad.id}?meta=1');
         if (!r.ok) return;
-        const p = await r.json();
-        const now = p.entries.map((e) => [e.seq, e.updated || e.created]);
-        if (p.title !== ${JSON.stringify(pad.title).replace(/</g, '\\u003c')}) return location.reload();
-        if (JSON.stringify(now) !== JSON.stringify(rendered)) location.reload();
+        const meta = await r.json();
+        if (meta.version !== ${pad.version}) location.reload();
       } catch {}
     }, 3000);
     // Long pads are tedious to scroll on a phone: one button that jumps to the
@@ -605,6 +976,47 @@ curl -s -X POST ${base}/api/pads/${pad.id}/entries \\
     addEventListener('resize', sync);
     sync();
     </script>`
+  );
+}
+
+function searchPage(q) {
+  const hits = q ? searchPads(q) : [];
+  const rows = hits
+    .map(
+      (h) => `<div class="card hit"><a href="${h.url}"><strong>${esc(h.padTitle)}</strong></a>
+      <span class="muted">${h.seq === null ? '· title' : `· #${h.seq} · ${esc(h.author)}`}
+      ${h.retracted ? '<span class="tag">retracted</span>' : ''}</span>
+      <div class="snippet">${esc(h.snippet)}</div></div>`
+    )
+    .join('\n');
+  return page(
+    q ? `search: ${q}` : 'search',
+    `<h2>Search</h2>
+    <form class="inline" method="get" action="/search">
+      <input name="q" value="${esc(q)}" placeholder="search all entries" style="flex:1" autofocus>
+      <button type="submit">Search</button>
+    </form>
+    ${q ? `<p class="muted">${hits.length} match${hits.length === 1 ? '' : 'es'} for <code>${esc(q)}</code></p>` : ''}
+    ${rows || (q ? '<p class="muted">Nothing found.</p>' : '')}`
+  );
+}
+
+function trashPage() {
+  const rows = trashList()
+    .map(
+      (t) => `<div class="card"><strong>${esc(t.title)}</strong>
+      <span class="muted">· ${t.entryCount} entr${t.entryCount === 1 ? 'y' : 'ies'}
+      · deleted ${esc(t.deleted)} · <code>${esc(t.id)}</code></span>
+      <form method="post" action="/trash/${esc(t.id)}/restore" style="display:inline">
+        <button type="submit" class="editbtn">restore</button>
+      </form></div>`
+    )
+    .join('\n');
+  return page(
+    'deleted pads',
+    `<h2>Deleted pads</h2>
+    <p class="muted">Deleting a pad moves it here. It is removed for good after ${TRASH_DAYS} days.</p>
+    ${rows || '<p class="muted">Nothing deleted.</p>'}`
   );
 }
 
@@ -649,22 +1061,112 @@ const server = http.createServer(async (req, res) => {
       const pad = loadPad(match[1]);
       if (!pad) return sendJson(res, 404, { error: `no pad ${match[1]}` });
       if (req.method === 'GET') {
-        if (url.searchParams.get('format') === 'text') return sendText(res, 200, padAsText(pad));
-        return sendJson(res, 200, pad);
+        const q = url.searchParams;
+        const num = (name) => (q.get(name) === null ? null : Number(q.get(name)));
+        const tail = num('tail');
+        const sinceVersion = num('since_version');
+        const wait = Math.min(Math.max(num('wait') || 0, 0), MAX_WAIT);
+        if (tail !== null && (!Number.isInteger(tail) || tail < 1)) {
+          return sendJson(res, 400, { error: 'tail must be a positive integer' });
+        }
+        if (sinceVersion !== null && (!Number.isInteger(sinceVersion) || sinceVersion < 0)) {
+          return sendJson(res, 400, { error: 'since_version must be a non-negative integer' });
+        }
+        if (q.get('meta') !== null) return sendJson(res, 200, padMeta(pad));
+
+        if (sinceVersion !== null) {
+          const answer = (fresh) =>
+            sendJson(res, 200, { ...padMeta(fresh), since_version: sinceVersion, entries: changedSince(fresh, sinceVersion) });
+          // Long-poll: hold the request until something changes or we time out.
+          // Answering immediately when the pad has already moved keeps a client
+          // that is behind from sleeping on news it could have had at once.
+          if (wait > 0 && pad.version <= sinceVersion) {
+            const cancel = waitForChange(pad.id, wait, () => answer(loadPad(pad.id) || pad));
+            req.on('close', cancel);
+            return;
+          }
+          return answer(pad);
+        }
+
+        const view = tail === null ? pad : { ...pad, entries: pad.entries.slice(-tail), tail };
+        if (q.get('format') === 'text') return sendText(res, 200, padAsText(view));
+        return sendJson(res, 200, view);
       }
       if (req.method === 'PATCH') {
         return apiRenamePad(res, pad, await readJsonBody(req));
       }
       if (req.method === 'DELETE') {
-        fs.unlinkSync(padPath(pad.id));
-        return sendJson(res, 200, { deleted: pad.id });
+        trashPad(pad.id);
+        return sendJson(res, 200, {
+          deleted: pad.id,
+          recoverable_until_days: TRASH_DAYS,
+          restore: `POST ${base}/api/trash/${pad.id}/restore`,
+        });
       }
     }
     if ((match = m(/^\/api\/pads\/([a-z0-9]{8})\/entries$/)) && req.method === 'POST') {
-      const body = await readJsonBody(req);
+      const ctype = String(req.headers['content-type'] || '').split(';')[0].trim();
+      const qAuthor = url.searchParams.get('author');
+      let body;
+      if (ctype === 'text/plain') {
+        // Prose without JSON escaping: the raw body IS the entry text.
+        body = {
+          author: qAuthor,
+          text: await readBody(req),
+          retracts: url.searchParams.get('retracts'),
+        };
+        if (!qAuthor) {
+          return sendJson(res, 400, { error: 'a text/plain body needs the author in the query string: ?author=<name>' });
+        }
+      } else {
+        body = await readJsonBody(req);
+        if (qAuthor && body.author) {
+          // Two sources for one field: refuse rather than pick a winner.
+          return sendJson(res, 400, { error: 'author given both in the query string and the body; send only one' });
+        }
+        if (qAuthor) body.author = qAuthor;
+      }
       const pad = loadPad(match[1]);
       if (!pad) return sendJson(res, 404, { error: `no pad ${match[1]}` });
+      const ifMatch = req.headers['if-match'];
+      if (ifMatch !== undefined) {
+        const want = Number(String(ifMatch).replace(/"/g, '').trim());
+        if (!Number.isInteger(want) || want < 0) {
+          return sendJson(res, 400, { error: 'If-Match must be the pad version you last read, e.g. If-Match: 42' });
+        }
+        if (pad.version !== want) {
+          const missed = changedSince(pad, want);
+          const brief = url.searchParams.get('brief') !== null;
+          return sendJson(res, 409, {
+            error: `pad moved from version ${want} to ${pad.version} since you read it; nothing was appended`,
+            advice: 're-read and re-decide. Do NOT re-post automatically: if this was an action announcement, one of the entries below may be the reason not to act.',
+            version: pad.version,
+            missed: brief
+              ? missed.map((e) => ({ seq: e.seq, author: e.author, version: e.version, chars: e.text.length }))
+              : missed,
+            brief,
+          });
+        }
+      }
       return apiAppendEntry(res, pad, body);
+    }
+
+    // --- trash: delete is undoable ---
+    if (p === '/api/trash' && req.method === 'GET') {
+      return sendJson(res, 200, trashList());
+    }
+    if ((match = m(/^\/api\/trash\/([a-z0-9]{8})\/restore$/)) && req.method === 'POST') {
+      const out = restoreFromTrash(match[1]);
+      if (out === null) return sendJson(res, 404, { error: `nothing in the trash for pad ${match[1]}` });
+      if (out === 'exists') return sendJson(res, 409, { error: `pad ${match[1]} exists again; not overwriting it` });
+      return sendJson(res, 200, { restored: out.id, url: `/pad/${out.id}` });
+    }
+
+    // --- search ---
+    if (p === '/api/search' && req.method === 'GET') {
+      const q = (url.searchParams.get('q') || '').trim();
+      if (!q) return sendJson(res, 400, { error: 'give a query: /api/search?q=<text>' });
+      return sendJson(res, 200, searchPads(q));
     }
     if ((match = m(/^\/api\/pads\/([a-z0-9]{8})\/entries\/(\d+)$/)) && req.method === 'PUT') {
       const body = await readJsonBody(req);
@@ -690,6 +1192,21 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(303, { Location: `/pad/${pad.id}` });
       return res.end();
     }
+    if (p === '/search' && req.method === 'GET') {
+      return sendHtml(res, 200, searchPage((url.searchParams.get('q') || '').trim()));
+    }
+    if (p === '/trash' && req.method === 'GET') {
+      return sendHtml(res, 200, trashPage());
+    }
+    if ((match = m(/^\/trash\/([a-z0-9]{8})\/restore$/)) && req.method === 'POST') {
+      const out = restoreFromTrash(match[1]);
+      if (!out || out === 'exists') {
+        res.writeHead(303, { Location: '/trash' });
+        return res.end();
+      }
+      res.writeHead(303, { Location: `/pad/${out.id}` });
+      return res.end();
+    }
     if ((match = m(/^\/pad\/([a-z0-9]{8})$/)) && req.method === 'GET') {
       const pad = loadPad(match[1]);
       if (!pad) return sendHtml(res, 404, page('not found', '<p>No such pad.</p>'));
@@ -700,15 +1217,34 @@ const server = http.createServer(async (req, res) => {
       const pad = loadPad(match[1]);
       if (!pad) return sendHtml(res, 404, page('not found', '<p>No such pad.</p>'));
       const author = (form.author || '').trim().slice(0, 100) || 'human';
+      const retracts = (form.retracts || '').trim();
       if (typeof form.text === 'string' && form.text.length) {
-        pad.entries.push({
+        const target = retracts ? pad.entries.find((e) => e.seq === Number(retracts)) : null;
+        if (retracts && (!target || target.retractedBy)) {
+          return sendHtml(res, 400, page('cannot retract',
+            `<p>${target ? `Entry #${esc(retracts)} was already retracted.` : `No entry #${esc(retracts)} in this pad.`}
+            <a href="/pad/${pad.id}">Back</a></p>`));
+        }
+        const entry = {
           seq: pad.nextSeq++,
           author,
           text: form.text,
           created: new Date().toISOString(),
           updated: null,
-        });
+          version: 0,
+          retracts: target ? target.seq : null,
+          retractedBy: null,
+        };
+        pad.entries.push(entry);
+        const v = (pad.version || 0) + 1;
+        entry.version = v;
+        if (target) {
+          target.retractedBy = { seq: entry.seq, author, at: entry.created };
+          target.version = v;
+        }
         savePad(pad);
+        res.writeHead(303, { Location: `/pad/${pad.id}#e${entry.seq}` });
+        return res.end();
       }
       res.writeHead(303, { Location: `/pad/${pad.id}` });
       return res.end();
@@ -739,14 +1275,14 @@ const server = http.createServer(async (req, res) => {
       if (typeof form.text === 'string' && form.text.length) {
         entry.text = form.text;
         entry.updated = new Date().toISOString();
-        savePad(pad);
+        saveWithEntry(pad, entry);
       }
       res.writeHead(303, { Location: `/pad/${pad.id}` });
       return res.end();
     }
     if ((match = m(/^\/pad\/([a-z0-9]{8})\/delete$/)) && req.method === 'POST') {
-      if (ID_RE.test(match[1]) && fs.existsSync(padPath(match[1]))) fs.unlinkSync(padPath(match[1]));
-      res.writeHead(303, { Location: '/' });
+      if (ID_RE.test(match[1]) && fs.existsSync(padPath(match[1]))) trashPad(match[1]);
+      res.writeHead(303, { Location: '/trash' });
       return res.end();
     }
 
